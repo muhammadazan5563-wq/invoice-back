@@ -166,9 +166,42 @@ export default async function apiHandler(req, res) {
     }
 
     if (path === '/api/invoices' && method === 'GET') {
-      if (!user) return json(res,401,{error:'Authentication required'});
-      const filter = user?.role === 'vendor' || user?.role === 'customer'; const args = filter ? [user.contact_id] : []; const where = filter ? ' WHERE customer_id=$1' : '';
-      const [a,b] = await Promise.all([query(`SELECT * FROM invoices${where} ORDER BY created_at DESC`, args), query(`SELECT * FROM vendor_invoices${where} ORDER BY created_at DESC`, args)]); return json(res, 200, [...a.rows.map((r)=>invoiceView(r,'customer')), ...b.rows.map((r)=>invoiceView(r,'vendor'))]);
+      if (!user) return json(res, 401, { error: 'Authentication required' });
+      const url = new URL(req.url, 'http://localhost');
+      const page = Math.max(1, Number(url.searchParams.get('page') || 1));
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') || 50)));
+      const offset = (page - 1) * limit;
+      const requestedType = url.searchParams.get('invoiceType');
+      const tables = requestedType === 'vendor'
+        ? [{ name: 'vendor_invoices', type: 'vendor' }]
+        : requestedType === 'customer'
+          ? [{ name: 'invoices', type: 'customer' }]
+          : [{ name: 'invoices', type: 'customer' }, { name: 'vendor_invoices', type: 'vendor' }];
+      const args = [];
+      const conditions = [];
+      const addParam = (value) => { args.push(value); return `$${args.length}`; };
+      if (user.role === 'vendor' || user.role === 'customer') conditions.push(`customer_id=${addParam(user.contact_id)}`);
+      const search = url.searchParams.get('search')?.trim();
+      if (search) {
+        const param = addParam(`%${search}%`);
+        conditions.push(`(id ILIKE ${param} OR customer_name ILIKE ${param} OR customer_email ILIKE ${param})`);
+      }
+      const status = url.searchParams.get('status');
+      if (status && status !== 'All') conditions.push(`status=${addParam(status)}`);
+      const fromMonth = url.searchParams.get('fromMonth');
+      if (fromMonth) conditions.push(`date >= ${addParam(`${fromMonth}-01`)}`);
+      const toMonth = url.searchParams.get('toMonth');
+      if (toMonth) conditions.push(`date < (${addParam(`${toMonth}-01`)}::date + INTERVAL '1 month')::text`);
+      const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+      const union = tables.map(({ name, type }) => `SELECT ${invoiceColumns}, created_at, '${type}' AS result_invoice_type FROM ${name}${where}`).join(' UNION ALL ');
+      const limitParam = addParam(limit);
+      const offsetParam = addParam(offset);
+      const [rowsResult, countResult] = await Promise.all([
+        query(`SELECT * FROM (${union}) combined ORDER BY created_at DESC, id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`, args),
+        query(`SELECT COUNT(*)::int AS total FROM (${union}) combined`, args.slice(0, args.length - 2)),
+      ]);
+      const total = Number(countResult.rows[0]?.total || 0);
+      return json(res, 200, { invoices: rowsResult.rows.map((row) => invoiceView(row, row.result_invoice_type)), page, limit, total, hasMore: offset + rowsResult.rows.length < total });
     }
     if (path === '/api/invoices' && method === 'POST') { if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const inv=req.body||{}; const table=inv.invoiceType==='vendor'?'vendor_invoices':'invoices'; const vals=invoiceParams(inv); await query(`INSERT INTO ${table} (${invoiceColumns}) VALUES (${vals.map((_,i)=>`$${i+1}`).join(',')})`, vals); return json(res,201,{success:true}); }
     const invoiceMatch = path.match(/^\/api\/invoices\/([^/]+)$/);
