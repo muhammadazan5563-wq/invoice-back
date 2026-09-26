@@ -125,7 +125,8 @@ export default async function apiHandler(req, res) {
       if (!user) return json(res, 401, { error: 'Authentication required' });
       const params = new URL(req.url, 'http://localhost').searchParams;
       const today = params.get('date') || new Date().toISOString().slice(0, 10);
-      return json(res, 200, await dashboardSummary(user, today, params.get('mode') === 'vendor' ? 'vendor' : 'customer'));
+      const mode = user.role === 'vendor' ? 'vendor' : user.role === 'customer' ? 'customer' : params.get('mode') === 'vendor' ? 'vendor' : 'customer';
+      return json(res, 200, await dashboardSummary(user, today, mode));
     }
     if (path === '/api/payment-logs' && method === 'GET') {
       if (!user) return json(res, 401, { error: 'Authentication required' });
