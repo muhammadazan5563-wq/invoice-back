@@ -126,6 +126,11 @@ async function applyPayment(contactId, amount, paymentDate, paymentId) {
       );
       firstAllocation = false;
     }
+    await client.query(
+      `INSERT INTO payment_logs(payment_id,contact_id,contact_name,contact_phone,amount,payment_date)
+       VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(payment_id) DO NOTHING`,
+      [paymentId, contact.id, contact.full_name || '', contact.phone || '', amount, paymentDate]
+    );
     await client.query('COMMIT');
     return { allocated: roundCurrency(allocated), outstanding: roundCurrency(outstanding), invoiceCount: invoices.length };
   } catch (error) {
@@ -194,12 +199,15 @@ export default async function apiHandler(req, res) {
       const page = Math.max(1, Number(url.searchParams.get('page') || 1));
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') || 50)));
       const offset = (page - 1) * limit;
-      const scope = user.role === 'vendor' || user.role === 'customer';
-      const args = scope ? [user.contact_id, limit, offset] : [limit, offset];
-      const where = scope ? 'WHERE customer_id=$1' : '';
-      const limitParam = scope ? '$2' : '$1'; const offsetParam = scope ? '$3' : '$2';
-      const { rows } = await query(`SELECT x.id,x.customer_name,x.customer_phone,p AS payment FROM (SELECT id,customer_name,customer_phone,payments FROM invoices ${where} UNION ALL SELECT id,customer_name,customer_phone,payments FROM vendor_invoices ${where}) x CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(x.payments)='array' THEN x.payments ELSE '[]'::jsonb END) p WHERE COALESCE(NULLIF(p->>'amount','')::numeric,0)>0 ORDER BY COALESCE(p->>'date','') DESC, x.id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`, args);
-      const logs = rows.map((row) => ({ paymentId: row.id + '-' + String(row.payment.paymentId || row.payment.date || 'payment'), date: row.payment.date || '', name: row.payment.contactName || row.customer_name || '', phone: row.payment.contactPhone || row.customer_phone || '', amount: Number(row.payment.amount || 0) }));
+      const args = [limit, offset];
+      const { rows } = await query(
+        `SELECT payment_id, payment_date, contact_name, contact_phone, amount
+         FROM payment_logs
+         ORDER BY created_at DESC, payment_id DESC
+         LIMIT $1 OFFSET $2`,
+        args
+      );
+      const logs = rows.map((row) => ({ paymentId: row.payment_id, date: row.payment_date || '', name: row.contact_name || '', phone: row.contact_phone || '', amount: Number(row.amount || 0) }));
       return json(res, 200, { page, limit, logs, hasMore: logs.length === limit });
     }
     if (path === '/api/payment-preview' && method === 'GET') {
