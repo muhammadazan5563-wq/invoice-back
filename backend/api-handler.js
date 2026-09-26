@@ -40,7 +40,8 @@ function sessionView(user, token) {
   } : null, accessToken: null };
 }
 function invoiceView(row, type) {
-  return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount: Number(row.total_amount || 0), taxRate: Number(row.tax_rate || 0), taxAmount: Number(row.tax_amount || 0), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: Number(row.expense_total || 0), amountPaid: Number(row.amount_paid || 0), paymentDate: row.payment_date || '', balance: Number(row.balance || 0), status: row.status || 'Pending', notes: row.notes || '', items: row.items || [], payments: row.payments || [], rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
+  const balance = Math.max(0, Math.round(Number(row.balance || 0) * 100) / 100);
+  return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount: Number(row.total_amount || 0), taxRate: Number(row.tax_rate || 0), taxAmount: Number(row.tax_amount || 0), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: Number(row.expense_total || 0), amountPaid: Number(row.amount_paid || 0), paymentDate: row.payment_date || '', balance, status: balance <= 0 ? 'Paid' : row.status || 'Pending', notes: row.notes || '', items: row.items || [], payments: row.payments || [], rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
 }
 const invoiceColumns = 'id,date,customer_name,customer_email,customer_phone,customer_id,total_amount,tax_rate,tax_amount,baraf,rickshaw_rent,worker_expense,expense_total,amount_paid,payment_date,balance,status,notes,items,payments,invoice_type';
 function normalizeInvoice(inv) {
@@ -55,7 +56,7 @@ function normalizeInvoice(inv) {
   const totalAmount = Math.round((subtotal + taxAmount + expenseTotal) * 100) / 100;
   const payments = (Array.isArray(inv.payments) ? inv.payments : []).filter((payment) => Number(payment.amount || 0) > 0);
   const amountPaid = Math.round((payments.length ? payments.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0) : Number(inv.amountPaid || 0)) * 100) / 100;
-  const balance = Math.round((totalAmount - amountPaid) * 100) / 100;
+  const balance = Math.max(0, Math.round((totalAmount - amountPaid) * 100) / 100);
   const status = balance <= 0 ? 'Paid' : inv.status === 'Overdue' ? 'Overdue' : inv.status === 'Unpaid' ? 'Unpaid' : 'Due';
   return { ...inv, totalAmount, taxRate, taxAmount, expenses, expenseTotal, amountPaid, balance, status, items, payments, paymentDate: payments.at(-1)?.date || inv.paymentDate || '' };
 }
@@ -75,12 +76,12 @@ async function dashboardSummary(user, today, mode = 'customer') {
     SELECT COUNT(*)::int AS total_invoices,
       COALESCE(SUM(total_amount),0) AS total_revenue,
       COALESCE(SUM(amount_paid),0) AS total_paid,
-      COALESCE(SUM(balance),0) AS total_pending,
+      COALESCE(SUM(GREATEST(balance,0)),0) AS total_pending,
       COUNT(*) FILTER (WHERE status='Paid')::int AS paid_count,
       COUNT(*) FILTER (WHERE status IN ('Pending','Due'))::int AS pending_count,
       COUNT(*) FILTER (WHERE status='Overdue')::int AS overdue_count,
-      COALESCE(SUM(balance) FILTER (WHERE status='Overdue'),0) AS overdue_amount,
-      COALESCE(SUM(balance) FILTER (WHERE status IN ('Pending','Due')),0) AS due_amount,
+      COALESCE(SUM(GREATEST(balance,0)) FILTER (WHERE status='Overdue'),0) AS overdue_amount,
+      COALESCE(SUM(GREATEST(balance,0)) FILTER (WHERE status IN ('Pending','Due')),0) AS due_amount,
       COALESCE(AVG(total_amount),0) AS average_invoice,
       COALESCE(SUM((SELECT SUM(CASE WHEN p->>'date'=${todayParam} THEN COALESCE(NULLIF(p->>'appliedAmount','')::numeric,NULLIF(p->>'amount','')::numeric,0) ELSE 0 END) FROM jsonb_array_elements(${paymentJsonSql()}) p)),0) AS today_collection,
       COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(${paymentJsonSql()}) p WHERE p->>'date'=${todayParam}))::int AS today_paid_count,
