@@ -1,6 +1,6 @@
 import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
-import { query } from './db.js';
+import { pool, query } from './db.js';
 
 const scrypt = promisify(scryptCallback);
 const SESSION_DAYS = 30;
@@ -75,6 +75,66 @@ function invoiceParams(inv) { const normalized = normalizeInvoice(inv); return [
 function contactView(c) { return { id: c.id, type: c.type, fullName: c.full_name, phone: c.phone, email: c.email, companyName: c.company_name, location: c.location, address: c.address, area: c.area, taxRate: Number(c.tax_rate || 0), cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '', cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '', chequeUrl: c.cheque_data || c.cheque_url || '', tempPassword: c.temp_password || '', createdAt: c.created_at }; }
 function adminOnly(user) { return user && user.role === 'admin'; }
 function paymentJsonSql(column = 'payments') { return `CASE WHEN jsonb_typeof(${column}) = 'array' THEN ${column} ELSE '[]'::jsonb END`; }
+async function applyPayment(contactId, amount, paymentDate, paymentId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const contactResult = await client.query('SELECT id,type,full_name,phone FROM contacts WHERE id=$1 LIMIT 1', [contactId]);
+    const contact = contactResult.rows[0];
+    if (!contact) throw new Error('Contact not found');
+    const table = contact.type === 'vendor' ? 'vendor_invoices' : 'invoices';
+    const invoiceResult = await client.query(
+      `SELECT id,date,customer_name,customer_phone,total_amount,amount_paid,balance,payments
+       FROM ${table} WHERE customer_id=$1 AND balance>0 ORDER BY date ASC, id ASC FOR UPDATE`,
+      [contactId]
+    );
+    const invoices = invoiceResult.rows;
+    const outstanding = invoices.reduce((sum, invoice) => sum + Math.max(0, Number(invoice.balance) || 0), 0);
+    const allocated = Math.min(amount, outstanding);
+    if (allocated <= 0) throw new Error('This contact has no unpaid invoices.');
+    let remaining = allocated;
+    let firstAllocation = true;
+    for (const invoice of invoices) {
+      if (remaining <= 0) break;
+      const currentBalance = Math.max(0, Number(invoice.balance) || 0);
+      const applied = Math.min(remaining, currentBalance);
+      remaining -= applied;
+      const payments = Array.isArray(invoice.payments) ? invoice.payments : [];
+      payments.push({
+        amount: applied,
+        appliedAmount: applied,
+        date: paymentDate,
+        paymentId,
+        contactName: contact.full_name || invoice.customer_name || '',
+        contactPhone: contact.phone || invoice.customer_phone || '',
+      });
+      if (firstAllocation && amount > allocated) {
+        payments.push({
+          amount: amount - allocated,
+          appliedAmount: 0,
+          date: paymentDate,
+          paymentId,
+          contactName: contact.full_name || invoice.customer_name || '',
+          contactPhone: contact.phone || invoice.customer_phone || '',
+        });
+      }
+      const amountPaid = roundCurrency(Number(invoice.amount_paid || 0) + applied);
+      const balance = roundCurrency(currentBalance - applied);
+      await client.query(
+        `UPDATE ${table} SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`,
+        [amountPaid, paymentDate, balance, balance <= 0 ? 'Paid' : 'Due', JSON.stringify(payments), invoice.id]
+      );
+      firstAllocation = false;
+    }
+    await client.query('COMMIT');
+    return { allocated: roundCurrency(allocated), outstanding: roundCurrency(outstanding), invoiceCount: invoices.length };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 async function dashboardSummary(user, today, mode = 'customer') {
   const scoped = user?.role === 'vendor' || user?.role === 'customer';
   const args = scoped ? [user.contact_id, today] : [today];
@@ -141,6 +201,28 @@ export default async function apiHandler(req, res) {
       const { rows } = await query(`SELECT x.id,x.customer_name,x.customer_phone,p AS payment FROM (SELECT id,customer_name,customer_phone,payments FROM invoices ${where} UNION ALL SELECT id,customer_name,customer_phone,payments FROM vendor_invoices ${where}) x CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(x.payments)='array' THEN x.payments ELSE '[]'::jsonb END) p WHERE COALESCE(NULLIF(p->>'amount','')::numeric,0)>0 ORDER BY COALESCE(p->>'date','') DESC, x.id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`, args);
       const logs = rows.map((row) => ({ paymentId: row.id + '-' + String(row.payment.paymentId || row.payment.date || 'payment'), date: row.payment.date || '', name: row.payment.contactName || row.customer_name || '', phone: row.payment.contactPhone || row.customer_phone || '', amount: Number(row.payment.amount || 0) }));
       return json(res, 200, { page, limit, logs, hasMore: logs.length === limit });
+    }
+    if (path === '/api/payment-preview' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const contactId = new URL(req.url, 'http://localhost').searchParams.get('contactId');
+      const contactResult = await query('SELECT type FROM contacts WHERE id=$1 LIMIT 1', [contactId]);
+      if (!contactResult.rows[0]) return json(res, 404, { error: 'Contact not found' });
+      const table = contactResult.rows[0].type === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const { rows } = await query(`SELECT COUNT(*)::int AS invoice_count, COALESCE(SUM(GREATEST(balance,0)),0) AS outstanding FROM ${table} WHERE customer_id=$1 AND balance>0`, [contactId]);
+      return json(res, 200, { invoiceCount: Number(rows[0]?.invoice_count || 0), outstanding: Number(rows[0]?.outstanding || 0) });
+    }
+    if (path === '/api/payments' && method === 'POST') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const contactId = String(req.body?.contactId || '').trim();
+      const amount = Number(req.body?.amount || 0);
+      if (!contactId || amount <= 0) return json(res, 400, { error: 'A contact and payment amount greater than zero are required' });
+      try {
+        const paymentDate = String(req.body?.paymentDate || new Date().toISOString().slice(0, 10));
+        const result = await applyPayment(contactId, amount, paymentDate, String(req.body?.paymentId || randomBytes(16).toString('hex')));
+        return json(res, 200, result);
+      } catch (error) {
+        return json(res, 400, { error: error.message || 'Could not apply payment' });
+      }
     }
     if (path === '/api/contacts' && method === 'GET') { if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const { rows } = await query('SELECT * FROM contacts ORDER BY created_at DESC'); return json(res, 200, rows.map(contactView)); }
     if (path === '/api/contacts' && method === 'POST') {
