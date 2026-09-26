@@ -7,6 +7,10 @@ const SESSION_DAYS = 30;
 const json = (res, status, value) => res.status(status).json(value);
 const emailOf = (value) => String(value || '').trim().toLowerCase();
 const hashToken = (value) => createHash('sha256').update(value).digest('hex');
+const roundCurrency = (value) => {
+  const rounded = Math.round((Number(value) || 0) * 100) / 100;
+  return Object.is(rounded, -0) ? 0 : rounded;
+};
 
 async function hashPassword(password) {
   const salt = randomBytes(16).toString('hex');
@@ -40,9 +44,9 @@ function sessionView(user, token) {
   } : null, accessToken: null };
 }
 function invoiceView(row, type) {
-  const totalAmount = Math.round(Number(row.total_amount || 0) * 100) / 100;
-  const amountPaid = Math.max(0, Math.round(Number(row.amount_paid || 0) * 100) / 100);
-  const balance = Math.round((totalAmount - amountPaid) * 100) / 100;
+  const totalAmount = roundCurrency(row.total_amount);
+  const amountPaid = Math.max(0, roundCurrency(row.amount_paid));
+  const balance = roundCurrency(totalAmount - amountPaid);
   return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount, taxRate: Number(row.tax_rate || 0), taxAmount: Number(row.tax_amount || 0), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: Number(row.expense_total || 0), amountPaid, paymentDate: row.payment_date || '', balance, status: balance <= 0 ? 'Paid' : row.status || 'Pending', notes: row.notes || '', items: row.items || [], payments: row.payments || [], rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
 }
 const invoiceColumns = 'id,date,customer_name,customer_email,customer_phone,customer_id,total_amount,tax_rate,tax_amount,baraf,rickshaw_rent,worker_expense,expense_total,amount_paid,payment_date,balance,status,notes,items,payments,invoice_type';
@@ -55,10 +59,10 @@ function normalizeInvoice(inv) {
     baraf: Number(inv.expenses?.baraf || 0), rickshawRent: Number(inv.expenses?.rickshawRent || 0), workerExpense: Number(inv.expenses?.workerExpense || 0),
   };
   const expenseTotal = expenses.baraf + expenses.rickshawRent + expenses.workerExpense;
-  const totalAmount = Math.round((subtotal + taxAmount + expenseTotal) * 100) / 100;
+  const totalAmount = roundCurrency(subtotal + taxAmount + expenseTotal);
   const payments = (Array.isArray(inv.payments) ? inv.payments : []).filter((payment) => Number(payment.amount || 0) > 0);
-  const amountPaid = Math.max(0, Math.round((payments.length ? payments.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0) : Number(inv.amountPaid || 0)) * 100) / 100);
-  const balance = Math.round((totalAmount - amountPaid) * 100) / 100;
+  const amountPaid = Math.max(0, roundCurrency(payments.length ? payments.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0) : inv.amountPaid));
+  const balance = roundCurrency(totalAmount - amountPaid);
   const status = balance <= 0 ? 'Paid' : inv.status === 'Overdue' ? 'Overdue' : inv.status === 'Unpaid' ? 'Unpaid' : 'Due';
   return { ...inv, totalAmount, taxRate, taxAmount, expenses, expenseTotal, amountPaid, balance, status, items, payments, paymentDate: payments.at(-1)?.date || inv.paymentDate || '' };
 }
