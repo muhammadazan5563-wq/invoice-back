@@ -62,6 +62,33 @@ function normalizeInvoice(inv) {
 function invoiceParams(inv) { const normalized = normalizeInvoice(inv); return [normalized.id, normalized.date || '', normalized.customerName || '', normalized.customerEmail || '', normalized.customerPhone || '', normalized.customerId || '', normalized.totalAmount, normalized.taxRate, normalized.taxAmount, normalized.expenses.baraf, normalized.expenses.rickshawRent, normalized.expenses.workerExpense, normalized.expenseTotal, normalized.amountPaid, normalized.paymentDate, normalized.balance, normalized.status, normalized.notes || '', JSON.stringify(normalized.items), JSON.stringify(normalized.payments), normalized.invoiceType === 'vendor' ? 'vendor' : 'customer']; }
 function contactView(c) { return { id: c.id, type: c.type, fullName: c.full_name, phone: c.phone, email: c.email, companyName: c.company_name, location: c.location, address: c.address, area: c.area, taxRate: Number(c.tax_rate || 0), cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '', cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '', chequeUrl: c.cheque_data || c.cheque_url || '', tempPassword: c.temp_password || '', createdAt: c.created_at }; }
 function adminOnly(user) { return user && user.role === 'admin'; }
+function paymentJsonSql(column = 'payments') { return `CASE WHEN jsonb_typeof(${column}) = 'array' THEN ${column} ELSE '[]'::jsonb END`; }
+async function dashboardSummary(user, today, mode = 'customer') {
+  const scoped = user?.role === 'vendor' || user?.role === 'customer';
+  const args = scoped ? [user.contact_id, today] : [today];
+  const where = scoped ? 'WHERE customer_id=$1' : '';
+  const todayParam = scoped ? '$2' : '$1';
+  const { rows } = await query(`
+    WITH combined AS (
+      SELECT total_amount,amount_paid,balance,status,payments,date FROM ${mode === 'vendor' ? 'vendor_invoices' : 'invoices'} ${where}
+    )
+    SELECT COUNT(*)::int AS total_invoices,
+      COALESCE(SUM(total_amount),0) AS total_revenue,
+      COALESCE(SUM(amount_paid),0) AS total_paid,
+      COALESCE(SUM(balance),0) AS total_pending,
+      COUNT(*) FILTER (WHERE status='Paid')::int AS paid_count,
+      COUNT(*) FILTER (WHERE status IN ('Pending','Due'))::int AS pending_count,
+      COUNT(*) FILTER (WHERE status='Overdue')::int AS overdue_count,
+      COALESCE(SUM(balance) FILTER (WHERE status='Overdue'),0) AS overdue_amount,
+      COALESCE(SUM(balance) FILTER (WHERE status IN ('Pending','Due')),0) AS due_amount,
+      COALESCE(AVG(total_amount),0) AS average_invoice,
+      COALESCE(SUM((SELECT SUM(CASE WHEN p->>'date'=${todayParam} THEN COALESCE(NULLIF(p->>'appliedAmount','')::numeric,NULLIF(p->>'amount','')::numeric,0) ELSE 0 END) FROM jsonb_array_elements(${paymentJsonSql()}) p)),0) AS today_collection,
+      COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(${paymentJsonSql()}) p WHERE p->>'date'=${todayParam}))::int AS today_paid_count,
+      COUNT(*) FILTER (WHERE status='Pending' AND date=${todayParam})::int AS today_pending_count
+    FROM combined`, args);
+  const r = rows[0] || {};
+  return { totalInvoices: Number(r.total_invoices || 0), totalRevenue: Number(r.total_revenue || 0), totalPaid: Number(r.total_paid || 0), totalPending: Number(r.total_pending || 0), paidCount: Number(r.paid_count || 0), pendingCount: Number(r.pending_count || 0), overdueCount: Number(r.overdue_count || 0), overdueAmount: Number(r.overdue_amount || 0), dueAmount: Number(r.due_amount || 0), averageInvoice: Number(r.average_invoice || 0), todayCollection: Number(r.today_collection || 0), todayPaidCount: Number(r.today_paid_count || 0), todayPendingCount: Number(r.today_pending_count || 0) };
+}
 
 export default async function apiHandler(req, res) {
   const path = req.url.split('?')[0]; const method = req.method;
@@ -82,6 +109,26 @@ export default async function apiHandler(req, res) {
     }
 
     const user = await currentUser(req);
+    if (path === '/api/dashboard/summary' && method === 'GET') {
+      if (!user) return json(res, 401, { error: 'Authentication required' });
+      const params = new URL(req.url, 'http://localhost').searchParams;
+      const today = params.get('date') || new Date().toISOString().slice(0, 10);
+      return json(res, 200, await dashboardSummary(user, today, params.get('mode') === 'vendor' ? 'vendor' : 'customer'));
+    }
+    if (path === '/api/payment-logs' && method === 'GET') {
+      if (!user) return json(res, 401, { error: 'Authentication required' });
+      const url = new URL(req.url, 'http://localhost');
+      const page = Math.max(1, Number(url.searchParams.get('page') || 1));
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') || 50)));
+      const offset = (page - 1) * limit;
+      const scope = user.role === 'vendor' || user.role === 'customer';
+      const args = scope ? [user.contact_id, limit, offset] : [limit, offset];
+      const where = scope ? 'WHERE customer_id=$1' : '';
+      const limitParam = scope ? '$2' : '$1'; const offsetParam = scope ? '$3' : '$2';
+      const { rows } = await query(`SELECT x.id,x.customer_name,x.customer_phone,p AS payment FROM (SELECT id,customer_name,customer_phone,payments FROM invoices ${where} UNION ALL SELECT id,customer_name,customer_phone,payments FROM vendor_invoices ${where}) x CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(x.payments)='array' THEN x.payments ELSE '[]'::jsonb END) p WHERE COALESCE(NULLIF(p->>'amount','')::numeric,0)>0 ORDER BY COALESCE(p->>'date','') DESC, x.id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`, args);
+      const logs = rows.map((row) => ({ paymentId: row.id + '-' + String(row.payment.paymentId || row.payment.date || 'payment'), date: row.payment.date || '', name: row.payment.contactName || row.customer_name || '', phone: row.payment.contactPhone || row.customer_phone || '', amount: Number(row.payment.amount || 0) }));
+      return json(res, 200, { page, limit, logs, hasMore: logs.length === limit });
+    }
     if (path === '/api/contacts' && method === 'GET') { if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const { rows } = await query('SELECT * FROM contacts ORDER BY created_at DESC'); return json(res, 200, rows.map(contactView)); }
     if (path === '/api/contacts' && method === 'POST') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const d = req.body || {}; const email = emailOf(d.email); const password = String(d.password || randomBytes(9).toString('base64url'));
