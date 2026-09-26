@@ -53,8 +53,8 @@ function normalizeInvoice(inv) {
   };
   const expenseTotal = expenses.baraf + expenses.rickshawRent + expenses.workerExpense;
   const totalAmount = Math.round((subtotal + taxAmount + expenseTotal) * 100) / 100;
-  const payments = Array.isArray(inv.payments) ? inv.payments : [];
-  const amountPaid = Math.round((payments.length ? payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0) : Number(inv.amountPaid || 0)) * 100) / 100;
+  const payments = (Array.isArray(inv.payments) ? inv.payments : []).filter((payment) => Number(payment.amount || 0) > 0);
+  const amountPaid = Math.round((payments.length ? payments.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0) : Number(inv.amountPaid || 0)) * 100) / 100;
   const balance = Math.round((totalAmount - amountPaid) * 100) / 100;
   const status = balance <= 0 ? 'Paid' : inv.status === 'Overdue' ? 'Overdue' : inv.status === 'Unpaid' ? 'Unpaid' : 'Due';
   return { ...inv, totalAmount, taxRate, taxAmount, expenses, expenseTotal, amountPaid, balance, status, items, payments, paymentDate: payments.at(-1)?.date || inv.paymentDate || '' };
