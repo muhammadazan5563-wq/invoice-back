@@ -169,7 +169,7 @@ export default async function apiHandler(req, res) {
       if (!user) return json(res, 401, { error: 'Authentication required' });
       const url = new URL(req.url, 'http://localhost');
       const page = Math.max(1, Number(url.searchParams.get('page') || 1));
-      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') || 50)));
+      const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit') || 300)));
       const offset = (page - 1) * limit;
       const requestedType = url.searchParams.get('invoiceType');
       const tables = requestedType === 'vendor'
@@ -181,13 +181,18 @@ export default async function apiHandler(req, res) {
       const conditions = [];
       const addParam = (value) => { args.push(value); return `$${args.length}`; };
       if (user.role === 'vendor' || user.role === 'customer') conditions.push(`customer_id=${addParam(user.contact_id)}`);
+      const customerId = url.searchParams.get('customerId')?.trim();
+      if (customerId && user.role === 'admin') conditions.push(`customer_id=${addParam(customerId)}`);
       const search = url.searchParams.get('search')?.trim();
       if (search) {
         const param = addParam(`%${search}%`);
         conditions.push(`(id ILIKE ${param} OR customer_name ILIKE ${param} OR customer_email ILIKE ${param})`);
       }
       const status = url.searchParams.get('status');
-      if (status && status !== 'All') conditions.push(`status=${addParam(status)}`);
+      if (status && status !== 'All') {
+        if (status === 'Paid') conditions.push('balance <= 0');
+        else conditions.push(`status=${addParam(status)}`);
+      }
       const fromMonth = url.searchParams.get('fromMonth');
       if (fromMonth) conditions.push(`date >= ${addParam(`${fromMonth}-01`)}`);
       const toMonth = url.searchParams.get('toMonth');
