@@ -61,7 +61,12 @@ function normalizeInvoice(inv) {
   const expenseTotal = roundCurrency(expenses.baraf + expenses.rickshawRent + expenses.workerExpense);
   const totalAmount = roundCurrency(subtotal + taxAmount + expenseTotal);
   const payments = (Array.isArray(inv.payments) ? inv.payments : []).filter((payment) => Number(payment.amount || 0) > 0);
-  const amountPaid = Math.max(0, roundCurrency(payments.length ? payments.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0) : inv.amountPaid));
+  // The editor's current amountPaid is authoritative. Payment history can
+  // contain legacy appliedAmount metadata from an earlier allocation, so only
+  // use it when the caller does not provide an explicit current total.
+  const paymentHistoryTotal = payments.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0);
+  const amountPaidInput = inv.amountPaid ?? inv.amount_paid;
+  const amountPaid = Math.max(0, roundCurrency(amountPaidInput ?? (payments.length ? paymentHistoryTotal : 0)));
   const balance = roundCurrency(totalAmount - amountPaid);
   const status = balance <= 0 ? 'Paid' : inv.status === 'Overdue' ? 'Overdue' : inv.status === 'Unpaid' ? 'Unpaid' : 'Due';
   return { ...inv, totalAmount, taxRate, taxAmount, expenses, expenseTotal, amountPaid, balance, status, items, payments, paymentDate: payments.at(-1)?.date || inv.paymentDate || '' };
