@@ -149,7 +149,21 @@ export default async function apiHandler(req, res) {
       const c = rows[0]; await query('INSERT INTO users(email,password_hash,role,contact_id) VALUES($1,$2,$3,$4)', [email, await hashPassword(password), c.type, c.id]); return json(res, 201, { contact: contactView(c), password });
     }
     const contactMatch = path.match(/^\/api\/contacts\/([^/]+)$/);
-    if (contactMatch && method === 'PUT') { if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const d = req.body || {}; const { rows } = await query(`UPDATE contacts SET type=$1,full_name=$2,phone=$3,company_name=$4,location=$5,address=$6,area=$7,tax_rate=$8,cnic_front_data=COALESCE(NULLIF($9,''),cnic_front_data),cnic_back_data=COALESCE(NULLIF($10,''),cnic_back_data),cheque_data=COALESCE(NULLIF($11,''),cheque_data),updated_at=NOW() WHERE id=$12 RETURNING *`, [d.type === 'vendor' ? 'vendor' : 'customer', d.fullName, d.phone || '', d.companyName || '', d.location || '', d.address || '', d.area || '', Number(d.taxRate || 0), d.cnicFrontData || '', d.cnicBackData || '', d.chequeData || '', contactMatch[1]]); return rows[0] ? json(res, 200, contactView(rows[0])) : json(res, 404, { error: 'Contact not found' }); }
+    if (contactMatch && method === 'PUT') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const d = req.body || {};
+      const email = emailOf(d.email);
+      if (!d.fullName || !email) return json(res, 400, { error: 'Full name and email are required' });
+      if (d.password && String(d.password).length < 6) return json(res, 400, { error: 'Password must be at least 6 characters' });
+      const { rows } = await query(`UPDATE contacts SET type=$1,full_name=$2,phone=$3,email=$4,company_name=$5,location=$6,address=$7,area=$8,tax_rate=$9,temp_password=CASE WHEN NULLIF($10,'') IS NULL THEN temp_password ELSE $10 END,cnic_front_data=COALESCE(NULLIF($11,''),cnic_front_data),cnic_back_data=COALESCE(NULLIF($12,''),cnic_back_data),cheque_data=COALESCE(NULLIF($13,''),cheque_data),updated_at=NOW() WHERE id=$14 RETURNING *`, [d.type === 'vendor' ? 'vendor' : 'customer', d.fullName.trim(), d.phone || '', email, d.companyName || '', d.location || '', d.address || '', d.area || '', Number(d.taxRate || 0), d.password || '', d.cnicFrontData || '', d.cnicBackData || '', d.chequeData || '', contactMatch[1]]);
+      if (!rows[0]) return json(res, 404, { error: 'Contact not found' });
+      if (d.password) {
+        await query('UPDATE users SET email=$1,password_hash=$2 WHERE contact_id=$3', [email, await hashPassword(String(d.password)), contactMatch[1]]);
+      } else {
+        await query('UPDATE users SET email=$1 WHERE contact_id=$2', [email, contactMatch[1]]);
+      }
+      return json(res, 200, contactView(rows[0]));
+    }
 
     if (path === '/api/invoices' && method === 'GET') {
       if (!user) return json(res,401,{error:'Authentication required'});
