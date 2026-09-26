@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import compression from 'compression';
 import apiHandler from './api-handler.js';
 import { migrate, ensureAdminFromEnv, pool } from './db.js';
 
@@ -7,6 +8,7 @@ const app = express();
 const port = Number(process.env.PORT || 8080);
 const origins = (process.env.FRONTEND_ORIGIN || '*').split(',').map((x) => x.trim()).filter(Boolean);
 app.use(express.json({ limit: '4mb' }));
+app.use(compression());
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origins.includes('*')) res.setHeader('Access-Control-Allow-Origin', '*');
