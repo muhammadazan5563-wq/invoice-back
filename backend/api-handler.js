@@ -4,6 +4,9 @@ import { pool, query } from './db.js';
 
 const scrypt = promisify(scryptCallback);
 const SESSION_DAYS = 30;
+const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000);
+const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
+const loginAttempts = new Map();
 const json = (res, status, value) => res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate').status(status).json(value);
 const emailOf = (value) => String(value || '').trim().toLowerCase();
 const hashToken = (value) => createHash('sha256').update(value).digest('hex');
@@ -74,6 +77,31 @@ function normalizeInvoice(inv) {
 function invoiceParams(inv) { const normalized = normalizeInvoice(inv); return [normalized.id, normalized.date || '', normalized.customerName || '', normalized.customerEmail || '', normalized.customerPhone || '', normalized.customerId || '', normalized.totalAmount, normalized.taxRate, normalized.taxAmount, normalized.expenses.baraf, normalized.expenses.rickshawRent, normalized.expenses.workerExpense, normalized.expenseTotal, normalized.amountPaid, normalized.paymentDate, normalized.balance, normalized.status, normalized.notes || '', JSON.stringify(normalized.items), JSON.stringify(normalized.payments), normalized.invoiceType === 'vendor' ? 'vendor' : 'customer']; }
 function contactView(c) { return { id: c.id, type: c.type, fullName: c.full_name, phone: c.phone, email: c.email, companyName: c.company_name, location: c.location, address: c.address, area: c.area, taxRate: Number(c.tax_rate || 0), cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '', cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '', chequeUrl: c.cheque_data || c.cheque_url || '', tempPassword: c.temp_password || '', createdAt: c.created_at }; }
 function adminOnly(user) { return user && user.role === 'admin'; }
+function loginKey(req, email) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return `${forwarded || req.ip || req.socket?.remoteAddress || 'unknown'}:${email}`;
+}
+function loginThrottleState(key) {
+  const now = Date.now();
+  if (loginAttempts.size > 10000) {
+    for (const [storedKey, storedState] of loginAttempts) {
+      if (now - storedState.startedAt >= LOGIN_WINDOW_MS && storedState.blockedUntil <= now) loginAttempts.delete(storedKey);
+    }
+  }
+  const state = loginAttempts.get(key);
+  if (!state || now - state.startedAt >= LOGIN_WINDOW_MS) {
+    const next = { startedAt: now, attempts: 0, blockedUntil: 0 };
+    loginAttempts.set(key, next);
+    return next;
+  }
+  return state;
+}
+function recordLoginFailure(key) {
+  const state = loginThrottleState(key);
+  state.attempts += 1;
+  if (state.attempts >= LOGIN_MAX_ATTEMPTS) state.blockedUntil = Date.now() + LOGIN_WINDOW_MS;
+}
+function clearLoginFailures(key) { loginAttempts.delete(key); }
 function paymentJsonSql(column = 'payments') { return `CASE WHEN jsonb_typeof(${column}) = 'array' THEN ${column} ELSE '[]'::jsonb END`; }
 async function applyPayment(contactId, amount, paymentDate, paymentId) {
   const client = await pool.connect();
@@ -174,8 +202,19 @@ export default async function apiHandler(req, res) {
     if (path === '/api/auth/logout' && method === 'POST') { const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim(); if (token) await query('DELETE FROM sessions WHERE token_hash=$1', [hashToken(token)]); return json(res, 200, { success: true }); }
     if (path === '/api/auth/login' && method === 'POST') {
       const email = emailOf(req.body?.email); const password = String(req.body?.password || '');
+      const attemptKey = loginKey(req, email);
+      const attemptState = loginThrottleState(attemptKey);
+      if (attemptState.blockedUntil > Date.now()) {
+        const retryAfter = Math.max(1, Math.ceil((attemptState.blockedUntil - Date.now()) / 1000));
+        res.set('Retry-After', String(retryAfter));
+        return json(res, 429, { error: 'Too many failed login attempts. Try again later.' });
+      }
       const { rows } = await query(`SELECT u.*,c.type,c.full_name,c.phone,c.company_name,c.location,c.address,c.area,c.tax_rate,c.cnic_front_url,c.cnic_back_url,c.cheque_url,c.temp_password,c.created_at AS contact_created_at FROM users u LEFT JOIN contacts c ON c.id=u.contact_id WHERE u.email=$1`, [email]);
-      if (!rows[0] || !(await verifyPassword(password, rows[0].password_hash))) return json(res, 401, { error: 'Invalid email or password' });
+      if (!rows[0] || !(await verifyPassword(password, rows[0].password_hash))) {
+        recordLoginFailure(attemptKey);
+        return json(res, 401, { error: 'Invalid email or password' });
+      }
+      clearLoginFailures(attemptKey);
       return json(res, 200, sessionView(rows[0], await createSession(rows[0].id)));
     }
     if (path === '/api/auth/bootstrap-admin' && method === 'POST') {
