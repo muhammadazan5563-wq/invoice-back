@@ -253,6 +253,26 @@ export default async function apiHandler(req, res) {
       const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC`, args);
       return json(res, 200, { invoices: rows.map((row) => invoiceView(row, invoiceType)), total: rows.length });
     }
+    if (path === '/api/invoices/ledger-date' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const date = new URL(req.url, 'http://localhost').searchParams.get('date')?.trim();
+      if (!date) return json(res, 400, { error: 'date is required' });
+      const paymentDateCondition = `(EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(payments)='array' THEN payments ELSE '[]'::jsonb END) payment WHERE payment->>'date'=$1) OR payment_date=$1)`;
+      const [customerResult, vendorResult] = await Promise.all([
+        query(`SELECT ${invoiceColumns}, created_at FROM invoices WHERE ${paymentDateCondition}`, [date]),
+        query(`SELECT ${invoiceColumns}, created_at FROM vendor_invoices WHERE ${paymentDateCondition}`, [date]),
+      ]);
+      const rows = [
+        ...customerResult.rows.map((row) => invoiceView(row, 'customer')),
+        ...vendorResult.rows.map((row) => invoiceView(row, 'vendor')),
+      ].map((invoice) => {
+        const paymentsForDate = invoice.payments.filter((payment) => payment.date === date);
+        return paymentsForDate.length > 0
+          ? { ...invoice, totalAmount: roundCurrency(paymentsForDate.reduce((sum, payment) => sum + Number(payment.amount || 0), 0)) }
+          : invoice;
+      }).sort((a, b) => (parseInt(a.id.replace(/\D/g, ''), 10) || 0) - (parseInt(b.id.replace(/\D/g, ''), 10) || 0));
+      return json(res, 200, { invoices: rows, total: rows.length });
+    }
     if (path === '/api/contacts' && method === 'GET') { if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const { rows } = await query('SELECT * FROM contacts ORDER BY created_at DESC'); return json(res, 200, rows.map(contactView)); }
     if (path === '/api/contacts' && method === 'POST') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const d = req.body || {}; const email = emailOf(d.email); const password = String(d.password || randomBytes(9).toString('base64url'));
@@ -330,11 +350,69 @@ export default async function apiHandler(req, res) {
     if (path === '/api/settings' && method === 'POST') {
       if (!user) return json(res,401,{error:'Authentication required'}); const s=req.body||{}; if(!s.user_id) return json(res,400,{error:'Missing user id'}); await query(`INSERT INTO user_settings(user_id,user_email,google_access_token,google_refresh_token,spreadsheet_settings,invoice_template,updated_at) VALUES($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (user_id) WHERE user_id IS NOT NULL DO UPDATE SET user_email=EXCLUDED.user_email,google_access_token=EXCLUDED.google_access_token,google_refresh_token=EXCLUDED.google_refresh_token,spreadsheet_settings=COALESCE(EXCLUDED.spreadsheet_settings,user_settings.spreadsheet_settings),invoice_template=COALESCE(EXCLUDED.invoice_template,user_settings.invoice_template),updated_at=NOW()`,[s.user_id,s.user_email||'',s.google_access_token||'',s.google_refresh_token||'',s.spreadsheet_settings?JSON.stringify(s.spreadsheet_settings):null,s.invoice_template?JSON.stringify(s.invoice_template):null]); return json(res,200,{success:true}); }
 
-    if (path === '/api/ledger-invoices' && method === 'GET') { const {rows}=await query('SELECT * FROM ledger_invoices ORDER BY created_at DESC'); return json(res,200,rows); }
+    if (path === '/api/ledger/bulk' && method === 'POST') {
+      if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'});
+      const payload = req.body || {};
+      const ledgerDate = String(payload.ledger_date || '').trim();
+      if (!ledgerDate) return json(res,400,{error:'ledger_date is required'});
+      const invoices = (Array.isArray(payload.invoices) ? payload.invoices : []).map((invoice) => ({
+        invoice_id: invoice.invoice_id || invoice.id || '',
+        guest_name: invoice.guest_name || '',
+        hotel_name: invoice.hotel_name || '',
+        total_amount: Number(invoice.total_amount || 0),
+      })).filter((invoice) => invoice.invoice_id);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `INSERT INTO ledger_invoices(id,ledger_date,invoices) VALUES($1,$2,$3::jsonb)
+           ON CONFLICT(ledger_date) DO UPDATE SET id=EXCLUDED.id,invoices=EXCLUDED.invoices`,
+          [`ledger-${ledgerDate}`, ledgerDate, JSON.stringify(invoices)]
+        );
+        for (const id of Array.isArray(payload.deleteExpenseIds) ? payload.deleteExpenseIds : []) await client.query('DELETE FROM cash_expenses WHERE id=$1', [id]);
+        for (const expense of Array.isArray(payload.expenses) ? payload.expenses : []) await client.query(
+          'INSERT INTO cash_expenses(name,amount,description,tag) VALUES($1,$2,$3,$4)',
+          [expense.name || '', Number(expense.amount || 0), expense.description || '', expense.tag || 'expense']
+        );
+        await client.query('COMMIT');
+        return json(res,201,{success:true, invoicesSaved:invoices.length, expensesSaved:Array.isArray(payload.expenses) ? payload.expenses.length : 0});
+      } catch (error) {
+        await client.query('ROLLBACK');
+        return json(res,400,{error:error.message || 'Failed to save ledger day'});
+      } finally { client.release(); }
+    }
+    if (path === '/api/ledger/bulk' && method === 'DELETE') {
+      if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'});
+      const ledgerDate = String(req.body?.ledger_date || '').trim();
+      if (!ledgerDate) return json(res,400,{error:'ledger_date is required'});
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM ledger_invoices WHERE ledger_date=$1', [ledgerDate]);
+        const expenses = await client.query(`SELECT id,created_at FROM cash_expenses WHERE created_at >= $1::date AND created_at < ($1::date + INTERVAL '1 day')`, [ledgerDate]);
+        for (const expense of expenses.rows) await client.query('DELETE FROM cash_expenses WHERE id=$1', [expense.id]);
+        await client.query('COMMIT');
+        return json(res,200,{success:true});
+      } catch (error) {
+        await client.query('ROLLBACK');
+        return json(res,400,{error:error.message || 'Failed to delete ledger day'});
+      } finally { client.release(); }
+    }
+    if (path === '/api/ledger-invoices' && method === 'GET') {
+      const {rows}=await query(`SELECT ledger_invoices.id,ledger_invoices.ledger_date,ledger_invoices.created_at,invoice.invoice_id,invoice.guest_name,invoice.hotel_name,invoice.total_amount FROM ledger_invoices CROSS JOIN LATERAL jsonb_to_recordset(ledger_invoices.invoices) AS invoice(invoice_id TEXT,guest_name TEXT,hotel_name TEXT,total_amount NUMERIC) ORDER BY ledger_invoices.ledger_date DESC`);
+      return json(res,200,rows.map((row) => ({ id: `${row.invoice_id}_${row.ledger_date}`, invoice_id: row.invoice_id, ledger_date: row.ledger_date, guest_name: row.guest_name, hotel_name: row.hotel_name, total_amount: Number(row.total_amount || 0), created_at: row.created_at })));
+    }
     if (path === '/api/cash-expenses' && method === 'GET') { const {rows}=await query('SELECT * FROM cash_expenses ORDER BY created_at DESC'); return json(res,200,rows); }
-    if (path === '/api/ledger-invoices' && method === 'POST') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const x=req.body||{}; await query('INSERT INTO ledger_invoices(id,guest_name,hotel_name,total_amount) VALUES($1,$2,$3,$4)',[x.id,x.guest_name,x.hotel_name,Number(x.total_amount||0)]); return json(res,201,{success:true}); }
+    if (path === '/api/ledger-invoices' && method === 'POST') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); return json(res,410,{error:'Use POST /api/ledger/bulk instead'}); }
     if (path === '/api/cash-expenses' && method === 'POST') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const x=req.body||{}; await query('INSERT INTO cash_expenses(name,amount,description,tag) VALUES($1,$2,$3,$4)',[x.name,Number(x.amount||0),x.description||'',x.tag||'expense']); return json(res,201,{success:true}); }
-    if (path.startsWith('/api/ledger-invoices/') && method === 'DELETE') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); await query('DELETE FROM ledger_invoices WHERE id=$1',[decodeURIComponent(path.split('/').pop())]); return json(res,200,{success:true}); }
+    if (path.startsWith('/api/ledger-invoices/') && method === 'DELETE') {
+      if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'});
+      const rawId = decodeURIComponent(path.split('/').pop());
+      const match = rawId.match(/^(.*)_(\d{4}-\d{2}-\d{2})$/);
+      if (!match) return json(res,400,{error:'Invalid ledger invoice id'});
+      await query(`UPDATE ledger_invoices SET invoices=(SELECT COALESCE(jsonb_agg(item),'[]'::jsonb) FROM jsonb_array_elements(invoices) item WHERE item->>'invoice_id'<>$1) WHERE ledger_date=$2`, [match[1], match[2]]);
+      return json(res,200,{success:true});
+    }
     if (path.startsWith('/api/cash-expenses/') && method === 'DELETE') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); await query('DELETE FROM cash_expenses WHERE id=$1',[decodeURIComponent(path.split('/').pop())]); return json(res,200,{success:true}); }
     if (path.startsWith('/api/public-invoice/') && method === 'GET') { const raw=decodeURIComponent(path.split('/').pop()); const {rows}=await query('SELECT * FROM invoices WHERE id=$1 OR UPPER(id)=UPPER($1) OR id LIKE $2 LIMIT 1',[raw,`%${raw.replace(/^INV-|^REF-/i,'')}`]); return rows[0]?json(res,200,invoiceView(rows[0],'customer')):json(res,404,{error:'Invoice not found'}); }
     if (path === '/api/google/token-info' && method === 'POST') {
