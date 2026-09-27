@@ -6,7 +6,11 @@ import { migrate, ensureAdminFromEnv, pool } from './db.js';
 
 const app = express();
 const port = Number(process.env.PORT || 8080);
-const origins = (process.env.FRONTEND_ORIGIN || '*').split(',').map((x) => x.trim()).filter(Boolean);
+const configuredOrigins = String(process.env.FRONTEND_ORIGIN || '').split(',').map((x) => x.trim()).filter(Boolean);
+if (process.env.NODE_ENV === 'production' && configuredOrigins.length === 0) {
+  throw new Error('FRONTEND_ORIGIN is required in production; refusing to start with wildcard CORS.');
+}
+const origins = configuredOrigins.length > 0 ? configuredOrigins : ['*'];
 app.use(express.json({ limit: '4mb' }));
 app.use(compression());
 app.use((req, res, next) => {
