@@ -100,6 +100,38 @@ CREATE TABLE IF NOT EXISTS cash_expenses (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS payment_logs (
+  payment_id TEXT PRIMARY KEY,
+  contact_id TEXT NOT NULL DEFAULT '',
+  contact_name TEXT NOT NULL DEFAULT '',
+  contact_phone TEXT NOT NULL DEFAULT '',
+  amount NUMERIC NOT NULL DEFAULT 0,
+  payment_date TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS payment_logs_created_at_idx ON payment_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS payment_logs_contact_id_idx ON payment_logs(contact_id);
+
+INSERT INTO payment_logs(payment_id, contact_id, contact_name, contact_phone, amount, payment_date)
+SELECT
+  COALESCE(NULLIF(payment->>'paymentId', ''), source.id || '-' || COALESCE(NULLIF(payment->>'date', ''), 'payment')),
+  source.customer_id,
+  COALESCE(NULLIF(payment->>'contactName', ''), source.customer_name),
+  COALESCE(NULLIF(payment->>'contactPhone', ''), source.customer_phone),
+  SUM(COALESCE(NULLIF(payment->>'amount', '')::numeric, 0)),
+  COALESCE(payment->>'date', '')
+FROM (
+  SELECT id, customer_id, customer_name, customer_phone, payments FROM invoices
+  UNION ALL
+  SELECT id, customer_id, customer_name, customer_phone, payments FROM vendor_invoices
+) source
+CROSS JOIN LATERAL jsonb_array_elements(
+  CASE WHEN jsonb_typeof(source.payments) = 'array' THEN source.payments ELSE '[]'::jsonb END
+) payment
+WHERE COALESCE(NULLIF(payment->>'amount', '')::numeric, 0) > 0
+GROUP BY 1, 2, 3, 4, 6
+ON CONFLICT(payment_id) DO NOTHING;
+
 CREATE INDEX IF NOT EXISTS invoices_created_at_idx ON invoices(created_at DESC);
 CREATE INDEX IF NOT EXISTS vendor_invoices_created_at_idx ON vendor_invoices(created_at DESC);
 CREATE INDEX IF NOT EXISTS invoices_customer_id_idx ON invoices(customer_id);
