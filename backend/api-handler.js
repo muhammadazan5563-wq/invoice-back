@@ -440,7 +440,14 @@ export default async function apiHandler(req, res) {
       return json(res,200,{success:true});
     }
     if (path.startsWith('/api/cash-expenses/') && method === 'DELETE') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); await query('DELETE FROM cash_expenses WHERE id=$1',[decodeURIComponent(path.split('/').pop())]); return json(res,200,{success:true}); }
-    if (path.startsWith('/api/public-invoice/') && method === 'GET') { const raw=decodeURIComponent(path.split('/').pop()); const {rows}=await query('SELECT * FROM invoices WHERE id=$1 OR UPPER(id)=UPPER($1) OR id LIKE $2 LIMIT 1',[raw,`%${raw.replace(/^INV-|^REF-/i,'')}`]); return rows[0]?json(res,200,invoiceView(rows[0],'customer')):json(res,404,{error:'Invoice not found'}); }
+    if (path.startsWith('/api/public-invoice/') && method === 'GET') {
+      const raw = decodeURIComponent(path.split('/').pop());
+      const lookup = [raw, `%${raw.replace(/^INV-|^REF-/i, '')}`];
+      const customerResult = await query('SELECT * FROM invoices WHERE id=$1 OR UPPER(id)=UPPER($1) OR id LIKE $2 LIMIT 1', lookup);
+      if (customerResult.rows[0]) return json(res, 200, invoiceView(customerResult.rows[0], 'customer'));
+      const vendorResult = await query('SELECT * FROM vendor_invoices WHERE id=$1 OR UPPER(id)=UPPER($1) OR id LIKE $2 LIMIT 1', lookup);
+      return vendorResult.rows[0] ? json(res, 200, invoiceView(vendorResult.rows[0], 'vendor')) : json(res, 404, { error: 'Invoice not found' });
+    }
     if (path === '/api/google/token-info' && method === 'POST') {
       const { accessToken } = req.body || {};
       if (!accessToken) return json(res, 400, { error: 'Access token is required' });
