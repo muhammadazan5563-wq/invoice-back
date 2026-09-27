@@ -251,7 +251,15 @@ export default async function apiHandler(req, res) {
       const search = url.searchParams.get('search')?.trim();
       if (search) { const param = addParam(`%${search}%`); conditions.push(`id ILIKE ${param}`); }
       const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC`, args);
-      return json(res, 200, { invoices: rows.map((row) => invoiceView(row, invoiceType)), total: rows.length });
+      const invoices = rows.map((row) => invoiceView(row, invoiceType));
+      const summary = invoices.reduce((result, invoice) => ({
+        billed: result.billed + invoice.totalAmount,
+        paid: result.paid + Math.min(invoice.totalAmount, Math.max(invoice.amountPaid, 0)),
+        outstanding: result.outstanding + Math.max(invoice.balance, 0),
+        settled: result.settled + (invoice.balance <= 0 ? 1 : 0),
+        overdue: result.overdue + (invoice.balance > 0 && invoice.status === 'Overdue' ? 1 : 0),
+      }), { billed: 0, paid: 0, outstanding: 0, settled: 0, overdue: 0 });
+      return json(res, 200, { invoices, total: invoices.length, summary });
     }
     if (path === '/api/contact-summary' && method === 'GET') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
