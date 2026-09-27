@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, scrypt as scryptCallback } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 
 const { Pool } = pg;
@@ -47,5 +48,15 @@ export async function ensureAdminFromEnv() {
 }
 
 export async function query(text, params) {
-  return pool.query(text, params);
+  const startedAt = performance.now();
+  try {
+    return await pool.query(text, params);
+  } finally {
+    const durationMs = performance.now() - startedAt;
+    const thresholdMs = Number(process.env.QUERY_SLOW_MS || 500);
+    if (durationMs >= thresholdMs) {
+      const sql = String(text).replace(/\s+/g, ' ').trim().slice(0, 240);
+      console.warn(JSON.stringify({ event: 'slow_query', durationMs: Math.round(durationMs), thresholdMs, sql }));
+    }
+  }
 }
