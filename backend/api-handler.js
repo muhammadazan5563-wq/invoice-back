@@ -272,11 +272,17 @@ export default async function apiHandler(req, res) {
       }
     }
     if (path === '/api/invoices/history' && method === 'GET') {
-      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      if (!user) return json(res, 401, { error: 'Authentication required' });
       const url = new URL(req.url, 'http://localhost');
       const contactId = url.searchParams.get('customerId')?.trim();
       const invoiceType = url.searchParams.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
       if (!contactId) return json(res, 400, { error: 'customerId is required' });
+      if (!adminOnly(user)) {
+        const expectedType = user.role === 'vendor' ? 'vendor' : 'customer';
+        if (user.contact_id !== contactId || expectedType !== invoiceType) {
+          return json(res, 403, { error: 'You may only access your own invoice history' });
+        }
+      }
       const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
       const args = [contactId];
       const conditions = ['customer_id=$1'];
@@ -301,11 +307,17 @@ export default async function apiHandler(req, res) {
       return json(res, 200, { invoices, total: invoices.length, summary });
     }
     if (path === '/api/contact-summary' && method === 'GET') {
-      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      if (!user) return json(res, 401, { error: 'Authentication required' });
       const params = new URL(req.url, 'http://localhost').searchParams;
       const contactId = params.get('customerId')?.trim();
       const invoiceType = params.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
       if (!contactId) return json(res, 400, { error: 'customerId is required' });
+      if (!adminOnly(user)) {
+        const expectedType = user.role === 'vendor' ? 'vendor' : 'customer';
+        if (user.contact_id !== contactId || expectedType !== invoiceType) {
+          return json(res, 403, { error: 'You may only access your own invoice summary' });
+        }
+      }
       const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
       const { rows } = await query(`
         SELECT COUNT(*)::int AS invoice_count,
