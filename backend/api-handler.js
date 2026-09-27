@@ -232,6 +232,27 @@ export default async function apiHandler(req, res) {
         return json(res, 400, { error: error.message || 'Could not apply payment' });
       }
     }
+    if (path === '/api/invoices/history' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const url = new URL(req.url, 'http://localhost');
+      const contactId = url.searchParams.get('customerId')?.trim();
+      const invoiceType = url.searchParams.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
+      if (!contactId) return json(res, 400, { error: 'customerId is required' });
+      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const args = [contactId];
+      const conditions = ['customer_id=$1'];
+      const addParam = (value) => { args.push(value); return `$${args.length}`; };
+      const status = url.searchParams.get('status');
+      if (status && status !== 'all' && status !== 'All') conditions.push(status === 'Paid' ? 'balance <= 0' : `status=${addParam(status)}`);
+      const fromDate = url.searchParams.get('fromDate');
+      if (fromDate) conditions.push(`date >= ${addParam(fromDate)}`);
+      const toDate = url.searchParams.get('toDate');
+      if (toDate) conditions.push(`date <= ${addParam(toDate)}`);
+      const search = url.searchParams.get('search')?.trim();
+      if (search) { const param = addParam(`%${search}%`); conditions.push(`id ILIKE ${param}`); }
+      const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC`, args);
+      return json(res, 200, { invoices: rows.map((row) => invoiceView(row, invoiceType)), total: rows.length });
+    }
     if (path === '/api/contacts' && method === 'GET') { if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const { rows } = await query('SELECT * FROM contacts ORDER BY created_at DESC'); return json(res, 200, rows.map(contactView)); }
     if (path === '/api/contacts' && method === 'POST') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const d = req.body || {}; const email = emailOf(d.email); const password = String(d.password || randomBytes(9).toString('base64url'));
@@ -260,7 +281,7 @@ export default async function apiHandler(req, res) {
       if (!user) return json(res, 401, { error: 'Authentication required' });
       const url = new URL(req.url, 'http://localhost');
       const page = Math.max(1, Number(url.searchParams.get('page') || 1));
-      const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit') || 300)));
+      const limit = Math.min(600, Math.max(1, Number(url.searchParams.get('limit') || 600)));
       const offset = (page - 1) * limit;
       const requestedType = url.searchParams.get('invoiceType');
       const tables = requestedType === 'vendor'
