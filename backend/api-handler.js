@@ -253,6 +253,24 @@ export default async function apiHandler(req, res) {
       const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC`, args);
       return json(res, 200, { invoices: rows.map((row) => invoiceView(row, invoiceType)), total: rows.length });
     }
+    if (path === '/api/contact-summary' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const params = new URL(req.url, 'http://localhost').searchParams;
+      const contactId = params.get('customerId')?.trim();
+      const invoiceType = params.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
+      if (!contactId) return json(res, 400, { error: 'customerId is required' });
+      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const { rows } = await query(`
+        SELECT COUNT(*)::int AS invoice_count,
+          COALESCE(SUM(total_amount),0) AS total_billed,
+          COALESCE(SUM(LEAST(total_amount,GREATEST(amount_paid,0))),0) AS total_paid,
+          COALESCE(SUM(GREATEST(balance,0)),0) AS outstanding,
+          COUNT(*) FILTER (WHERE balance <= 0)::int AS settled,
+          COUNT(*) FILTER (WHERE balance > 0 AND status='Overdue')::int AS overdue
+        FROM ${table} WHERE customer_id=$1`, [contactId]);
+      const row = rows[0] || {};
+      return json(res, 200, { billed: Number(row.total_billed || 0), paid: Number(row.total_paid || 0), outstanding: Number(row.outstanding || 0), settled: Number(row.settled || 0), overdue: Number(row.overdue || 0), invoiceCount: Number(row.invoice_count || 0) });
+    }
     if (path === '/api/invoices/ledger-date' && method === 'GET') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const date = new URL(req.url, 'http://localhost').searchParams.get('date')?.trim();
