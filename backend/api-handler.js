@@ -4,7 +4,7 @@ import { pool, query } from './db.js';
 
 const scrypt = promisify(scryptCallback);
 const SESSION_DAYS = 30;
-const json = (res, status, value) => res.status(status).json(value);
+const json = (res, status, value) => res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate').status(status).json(value);
 const emailOf = (value) => String(value || '').trim().toLowerCase();
 const hashToken = (value) => createHash('sha256').update(value).digest('hex');
 const roundCurrency = (value) => {
