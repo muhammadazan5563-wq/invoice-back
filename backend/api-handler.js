@@ -378,7 +378,7 @@ export default async function apiHandler(req, res) {
       if (!user) return json(res, 401, { error: 'Authentication required' });
       const url = new URL(req.url, 'http://localhost');
       const page = Math.max(1, Number(url.searchParams.get('page') || 1));
-      const limit = Math.min(600, Math.max(1, Number(url.searchParams.get('limit') || 600)));
+      const limit = Math.min(2000, Math.max(1, Number(url.searchParams.get('limit') || 2000)));
       const offset = (page - 1) * limit;
       const requestedType = url.searchParams.get('invoiceType');
       const tables = requestedType === 'vendor'
