@@ -58,7 +58,7 @@ function normalizeInvoice(inv) {
   const subtotal = items.length ? items.reduce((sum, item) => sum + Number(item.total || (Number(item.quantity || 0) * Number(item.price || 0))), 0) : Number(inv.subtotal ?? inv.totalAmount ?? 0);
   const taxRate = Number(inv.taxRate || 0);
   const taxAmount = roundCurrency(subtotal * taxRate / 100);
-  const expenses = inv.invoiceType === 'vendor' ? { baraf: 0, rickshawRent: 0, workerExpense: 0 } : {
+  const expenses = inv.invoiceType === 'customer' ? { baraf: 0, rickshawRent: 0, workerExpense: 0 } : {
     baraf: Number(inv.expenses?.baraf || 0), rickshawRent: Number(inv.expenses?.rickshawRent || 0), workerExpense: Number(inv.expenses?.workerExpense || 0),
   };
   const expenseTotal = roundCurrency(expenses.baraf + expenses.rickshawRent + expenses.workerExpense);
