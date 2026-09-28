@@ -334,7 +334,7 @@ export default async function apiHandler(req, res) {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const date = new URL(req.url, 'http://localhost').searchParams.get('date')?.trim();
       if (!date) return json(res, 400, { error: 'date is required' });
-      const paymentDateCondition = `(EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(payments)='array' THEN payments ELSE '[]'::jsonb END) payment WHERE payment->>'date'=$1) OR payment_date=$1)`;
+      const paymentDateCondition = `(EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(payments)='array' THEN payments ELSE '[]'::jsonb END) payment WHERE payment->>'date'=$1) OR payment_date=$1 OR (date=$1 AND amount_paid > 0))`;
       const [customerResult, vendorResult] = await Promise.all([
         query(`SELECT ${invoiceColumns}, created_at FROM invoices WHERE ${paymentDateCondition}`, [date]),
         query(`SELECT ${invoiceColumns}, created_at FROM vendor_invoices WHERE ${paymentDateCondition}`, [date]),
@@ -437,6 +437,7 @@ export default async function apiHandler(req, res) {
         guest_name: invoice.guest_name || '',
         hotel_name: invoice.hotel_name || '',
         total_amount: Number(invoice.total_amount || 0),
+        invoice_type: invoice.invoice_type === 'vendor' ? 'vendor' : 'customer',
       })).filter((invoice) => invoice.invoice_id);
       const client = await pool.connect();
       try {
@@ -448,8 +449,8 @@ export default async function apiHandler(req, res) {
         );
         for (const id of Array.isArray(payload.deleteExpenseIds) ? payload.deleteExpenseIds : []) await client.query('DELETE FROM cash_expenses WHERE id=$1', [id]);
         for (const expense of Array.isArray(payload.expenses) ? payload.expenses : []) await client.query(
-          'INSERT INTO cash_expenses(name,amount,description,tag) VALUES($1,$2,$3,$4)',
-          [expense.name || '', Number(expense.amount || 0), expense.description || '', expense.tag || 'expense']
+          'INSERT INTO cash_expenses(name,amount,description,tag,created_at) VALUES($1,$2,$3,$4,$5)',
+          [expense.name || '', Number(expense.amount || 0), expense.description || '', expense.tag || 'expense', `${ledgerDate}T12:00:00.000Z`]
         );
         await client.query('COMMIT');
         return json(res,201,{success:true, invoicesSaved:invoices.length, expensesSaved:Array.isArray(payload.expenses) ? payload.expenses.length : 0});
