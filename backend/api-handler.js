@@ -334,7 +334,7 @@ export default async function apiHandler(req, res) {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const date = new URL(req.url, 'http://localhost').searchParams.get('date')?.trim();
       if (!date) return json(res, 400, { error: 'date is required' });
-      const paymentDateCondition = `(EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(payments)='array' THEN payments ELSE '[]'::jsonb END) payment WHERE payment->>'date'=$1) OR payment_date=$1 OR (date=$1 AND amount_paid > 0))`;
+      const paymentDateCondition = `EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(payments)='array' THEN payments ELSE '[]'::jsonb END) payment WHERE payment->>'date'=$1 AND COALESCE(NULLIF(payment->>'appliedAmount','')::numeric,NULLIF(payment->>'amount','')::numeric,0)>0)`;
       const [customerResult, vendorResult] = await Promise.all([
         query(`SELECT ${invoiceColumns}, created_at FROM invoices WHERE ${paymentDateCondition}`, [date]),
         query(`SELECT ${invoiceColumns}, created_at FROM vendor_invoices WHERE ${paymentDateCondition}`, [date]),
@@ -345,7 +345,7 @@ export default async function apiHandler(req, res) {
       ].map((invoice) => {
         const paymentsForDate = invoice.payments.filter((payment) => payment.date === date);
         return paymentsForDate.length > 0
-          ? { ...invoice, totalAmount: roundCurrency(paymentsForDate.reduce((sum, payment) => sum + Number(payment.amount || 0), 0)) }
+          ? { ...invoice, totalAmount: roundCurrency(paymentsForDate.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0)) }
           : invoice;
       }).sort((a, b) => (parseInt(a.id.replace(/\D/g, ''), 10) || 0) - (parseInt(b.id.replace(/\D/g, ''), 10) || 0));
       return json(res, 200, { invoices: rows, total: rows.length });
