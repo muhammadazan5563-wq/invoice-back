@@ -175,7 +175,7 @@ async function dashboardSummary(user, today, mode = 'customer') {
   const todayParam = scoped ? '$2' : '$1';
   const { rows } = await query(`
     WITH combined AS (
-      SELECT total_amount,amount_paid,balance,status,payments,date FROM ${mode === 'vendor' ? 'vendor_invoices' : 'invoices'} ${where}
+      SELECT total_amount,amount_paid,balance,status,payments,payment_date,date FROM ${mode === 'vendor' ? 'vendor_invoices' : 'invoices'} ${where}
     )
     SELECT COUNT(*)::int AS total_invoices,
       COALESCE(SUM(total_amount),0) AS total_revenue,
@@ -187,8 +187,8 @@ async function dashboardSummary(user, today, mode = 'customer') {
       COALESCE(SUM(GREATEST(balance,0)) FILTER (WHERE status='Overdue'),0) AS overdue_amount,
       COALESCE(SUM(GREATEST(balance,0)) FILTER (WHERE status IN ('Pending','Due')),0) AS due_amount,
       COALESCE(AVG(total_amount),0) AS average_invoice,
-      COALESCE(SUM(LEAST(total_amount,(SELECT SUM(CASE WHEN p->>'date'=${todayParam} THEN COALESCE(NULLIF(p->>'appliedAmount','')::numeric,NULLIF(p->>'amount','')::numeric,0) ELSE 0 END) FROM jsonb_array_elements(${paymentJsonSql()}) p))),0) AS today_collection,
-      COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(${paymentJsonSql()}) p WHERE p->>'date'=${todayParam}))::int AS today_paid_count,
+      COALESCE(SUM(LEAST(total_amount,GREATEST(COALESCE((SELECT SUM(COALESCE(NULLIF(p->>'appliedAmount','')::numeric,NULLIF(p->>'amount','')::numeric,0)) FROM jsonb_array_elements(${paymentJsonSql()}) p WHERE p->>'date'=${todayParam}), CASE WHEN payment_date=${todayParam} THEN amount_paid ELSE 0 END),0))),0) AS today_collection,
+      COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(${paymentJsonSql()}) p WHERE p->>'date'=${todayParam}) OR (payment_date=${todayParam} AND amount_paid > 0))::int AS today_paid_count,
       COUNT(*) FILTER (WHERE status='Pending' AND date=${todayParam})::int AS today_pending_count
     FROM combined`, args);
   const r = rows[0] || {};
