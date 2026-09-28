@@ -476,8 +476,8 @@ export default async function apiHandler(req, res) {
       } finally { client.release(); }
     }
     if (path === '/api/ledger-invoices' && method === 'GET') {
-      const {rows}=await query(`SELECT ledger_invoices.id,ledger_invoices.ledger_date,ledger_invoices.created_at,invoice.invoice_id,invoice.guest_name,invoice.hotel_name,invoice.total_amount FROM ledger_invoices CROSS JOIN LATERAL jsonb_to_recordset(ledger_invoices.invoices) AS invoice(invoice_id TEXT,guest_name TEXT,hotel_name TEXT,total_amount NUMERIC) ORDER BY ledger_invoices.ledger_date DESC`);
-      return json(res,200,rows.map((row) => ({ id: `${row.invoice_id}_${row.ledger_date}`, invoice_id: row.invoice_id, ledger_date: row.ledger_date, guest_name: row.guest_name, hotel_name: row.hotel_name, total_amount: Number(row.total_amount || 0), created_at: row.created_at })));
+      const {rows}=await query(`SELECT ledger_invoices.id,ledger_invoices.ledger_date,ledger_invoices.created_at,invoice.invoice_id,invoice.guest_name,invoice.hotel_name,invoice.total_amount,invoice.invoice_type FROM ledger_invoices CROSS JOIN LATERAL jsonb_to_recordset(ledger_invoices.invoices) AS invoice(invoice_id TEXT,guest_name TEXT,hotel_name TEXT,total_amount NUMERIC,invoice_type TEXT) ORDER BY ledger_invoices.ledger_date DESC`);
+      return json(res,200,rows.map((row) => ({ id: `${row.invoice_id}_${row.ledger_date}`, invoice_id: row.invoice_id, ledger_date: row.ledger_date, guest_name: row.guest_name, hotel_name: row.hotel_name, total_amount: Number(row.total_amount || 0), invoice_type: row.invoice_type === 'vendor' ? 'vendor' : 'customer', created_at: row.created_at })));
     }
     if (path === '/api/cash-expenses' && method === 'GET') { const {rows}=await query('SELECT * FROM cash_expenses ORDER BY created_at DESC'); return json(res,200,rows); }
     if (path === '/api/ledger-invoices' && method === 'POST') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); return json(res,410,{error:'Use POST /api/ledger/bulk instead'}); }
