@@ -83,16 +83,42 @@ function consumeUnappliedCredit(payments, amount) {
   for (let index = nextPayments.length - 1; index >= 0 && remaining > 0; index -= 1) {
     const payment = nextPayments[index];
     const paymentAmount = Number(payment.amount || 0);
-    const appliedAmount = Number(payment.appliedAmount ?? payment.amount ?? 0);
-    const unappliedAmount = Math.max(0, paymentAmount - appliedAmount);
-    if (unappliedAmount <= 0) continue;
-    const consumed = Math.min(remaining, unappliedAmount);
+    if (paymentAmount <= 0) continue;
+    const consumed = Math.min(remaining, paymentAmount);
     payment.amount = roundCurrency(paymentAmount - consumed);
+    if (payment.appliedAmount !== undefined) {
+      payment.appliedAmount = roundCurrency(Math.min(Number(payment.appliedAmount || 0), payment.amount));
+    }
     remaining -= consumed;
   }
   return nextPayments.filter((payment) => Number(payment.amount || 0) > 0);
 }
 function contactView(c) { return { id: c.id, type: c.type, fullName: c.full_name, phone: c.phone, email: c.email, companyName: c.company_name, location: c.location, address: c.address, area: c.area, taxRate: Number(c.tax_rate || 0), cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '', cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '', chequeUrl: c.cheque_data || c.cheque_url || '', tempPassword: c.temp_password || '', createdAt: c.created_at }; }
+async function applyCustomerCredit(client, normalized) {
+  let newAmountPaid = normalized.amountPaid;
+  let newBalance = normalized.balance;
+  let newPayments = [...normalized.payments];
+  if (normalized.invoiceType === 'vendor' || !normalized.customerId || newBalance <= 0) return { amountPaid: newAmountPaid, balance: newBalance, payments: newPayments, applied: 0 };
+  const creditResult = await client.query(
+    `SELECT id,total_amount,amount_paid,balance,payments FROM invoices WHERE customer_id=$1 AND id<>$2 AND (balance<0 OR total_amount<amount_paid OR total_amount<(SELECT COALESCE(SUM(COALESCE(NULLIF(payment->>'amount','')::numeric,0)),0) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(invoices.payments)='array' THEN invoices.payments ELSE '[]'::jsonb END) payment)) ORDER BY date ASC,id ASC FOR UPDATE`,
+    [normalized.customerId, normalized.id]
+  );
+  for (const creditInvoice of creditResult.rows) {
+    if (newBalance <= 0) break;
+    const paymentHistoryTotal = (Array.isArray(creditInvoice.payments) ? creditInvoice.payments : []).reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+    const oldPaidTotal = Math.max(Number(creditInvoice.amount_paid || 0), paymentHistoryTotal);
+    const adjustment = Math.min(Math.max(0, oldPaidTotal - Number(creditInvoice.total_amount || 0)), newBalance);
+    if (adjustment <= 0) continue;
+    const updatedOldPayments = consumeUnappliedCredit(Array.isArray(creditInvoice.payments) ? creditInvoice.payments : [], adjustment);
+    const oldAmountPaid = roundCurrency(oldPaidTotal - adjustment);
+    const oldBalance = roundCurrency(Number(creditInvoice.total_amount || 0) - oldAmountPaid);
+    await client.query(`UPDATE invoices SET amount_paid=$1,balance=$2,status=$3,payments=$4 WHERE id=$5`, [oldAmountPaid, oldBalance, oldBalance <= 0 ? 'Paid' : 'Due', JSON.stringify(updatedOldPayments), creditInvoice.id]);
+    newAmountPaid = roundCurrency(newAmountPaid + adjustment);
+    newBalance = roundCurrency(newBalance - adjustment);
+    newPayments.push({ amount: adjustment, appliedAmount: adjustment, date: normalized.date, paymentId: `credit-${creditInvoice.id}-${normalized.id}`, contactName: normalized.customerName || '', contactPhone: normalized.customerPhone || '' });
+  }
+  return { amountPaid: newAmountPaid, balance: newBalance, payments: newPayments, applied: roundCurrency(newAmountPaid - normalized.amountPaid) };
+}
 function adminOnly(user) { return user && user.role === 'admin'; }
 function loginKey(req, email) {
   const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -501,7 +527,29 @@ export default async function apiHandler(req, res) {
       }
     }
     const invoiceMatch = path.match(/^\/api\/invoices\/([^/]+)$/);
-    if (invoiceMatch && method === 'PUT') { if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const inv=req.body||{}; const table=inv.invoiceType==='vendor'?'vendor_invoices':'invoices'; const vals=invoiceParams({...inv,id:decodeURIComponent(invoiceMatch[1])}); await query(`UPDATE ${table} SET date=$2,customer_name=$3,customer_email=$4,customer_phone=$5,customer_id=$6,total_amount=$7,tax_rate=$8,tax_amount=$9,baraf=$10,rickshaw_rent=$11,worker_expense=$12,expense_total=$13,amount_paid=$14,payment_date=$15,balance=$16,status=$17,notes=$18,items=$19,payments=$20,invoice_type=$21 WHERE id=$1`, vals); return json(res,200,{success:true}); }
+    if (invoiceMatch && method === 'PUT') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const inv = req.body || {};
+      const normalized = normalizeInvoice({ ...inv, id: decodeURIComponent(invoiceMatch[1]) });
+      const table = normalized.invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const vals = invoiceParams(normalized);
+        await client.query(`UPDATE ${table} SET date=$2,customer_name=$3,customer_email=$4,customer_phone=$5,customer_id=$6,total_amount=$7,tax_rate=$8,tax_amount=$9,baraf=$10,rickshaw_rent=$11,worker_expense=$12,expense_total=$13,amount_paid=$14,payment_date=$15,balance=$16,status=$17,notes=$18,items=$19,payments=$20,invoice_type=$21 WHERE id=$1`, vals);
+        const adjusted = await applyCustomerCredit(client, normalized);
+        if (adjusted.applied > 0) {
+          await client.query(`UPDATE invoices SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`, [adjusted.amountPaid, normalized.date, adjusted.balance, adjusted.balance <= 0 ? 'Paid' : normalized.status, JSON.stringify(adjusted.payments), normalized.id]);
+        }
+        await client.query('COMMIT');
+        return json(res, 200, { success: true, creditApplied: adjusted.applied });
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
     if (invoiceMatch && method === 'DELETE') { if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const table=new URL(req.url,'http://localhost').searchParams.get('invoiceType')==='vendor'?'vendor_invoices':'invoices'; await query(`DELETE FROM ${table} WHERE id=$1`,[decodeURIComponent(invoiceMatch[1])]); return json(res,200,{success:true}); }
 
     if (path.startsWith('/api/settings/') && method === 'GET') {
