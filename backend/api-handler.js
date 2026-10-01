@@ -384,6 +384,27 @@ export default async function apiHandler(req, res) {
       const row = rows[0] || {};
       return json(res, 200, { billed: Number(row.total_billed || 0), paid: Number(row.total_paid || 0), outstanding: Number(row.outstanding || 0), settled: Number(row.settled || 0), overdue: Number(row.overdue || 0), invoiceCount: Number(row.invoice_count || 0) });
     }
+    if (path === '/api/invoices/expenses' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const url = new URL(req.url, 'http://localhost');
+      const fromDate = url.searchParams.get('fromDate')?.trim();
+      const toDate = url.searchParams.get('toDate')?.trim();
+      const expenseFields = { baraf: 'baraf', rickshawRent: 'rickshaw_rent', workerExpense: 'worker_expense' };
+      const expense = url.searchParams.get('expense') || 'baraf';
+      const expenseField = expenseFields[expense];
+      if (!fromDate || !toDate || !expenseField) return json(res, 400, { error: 'Valid fromDate, toDate and expense are required' });
+      const { rows } = await query(
+        `SELECT ${invoiceColumns} FROM vendor_invoices WHERE date >= $1 AND date <= $2 AND ${expenseField} > 0 ORDER BY date DESC, id DESC`,
+        [fromDate, toDate]
+      );
+      const invoices = rows.map((row) => invoiceView(row, 'vendor'));
+      const totalExpense = invoices.reduce((sum, invoice) => sum + Number(invoice.expenses?.[expense] || 0), 0);
+      const totalInvoiceAmount = invoices.reduce((sum, invoice) => sum + Number(invoice.totalAmount || 0), 0);
+      return json(res, 200, {
+        invoices,
+        summary: { totalExpense: roundCurrency(totalExpense), invoiceCount: invoices.length, totalInvoiceAmount: roundCurrency(totalInvoiceAmount) },
+      });
+    }
     if (path === '/api/invoices/ledger-date' && method === 'GET') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const date = new URL(req.url, 'http://localhost').searchParams.get('date')?.trim();
