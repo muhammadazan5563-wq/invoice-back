@@ -48,9 +48,11 @@ function sessionView(user, token) {
 }
 function invoiceView(row, type) {
   const totalAmount = roundCurrency(row.total_amount);
-  const amountPaid = Math.max(0, roundCurrency(row.amount_paid));
+  const payments = Array.isArray(row.payments) ? row.payments : [];
+  const paymentHistoryTotal = payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+  const amountPaid = roundCurrency(Math.max(Number(row.amount_paid || 0), paymentHistoryTotal));
   const balance = roundCurrency(totalAmount - amountPaid);
-  return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount, taxRate: Number(row.tax_rate || 0), taxAmount: roundCurrency(row.tax_amount), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: roundCurrency(row.expense_total), amountPaid, paymentDate: row.payment_date || '', balance, status: balance <= 0 ? 'Paid' : row.status || 'Pending', notes: row.notes || '', items: row.items || [], payments: row.payments || [], rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
+  return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount, taxRate: Number(row.tax_rate || 0), taxAmount: roundCurrency(row.tax_amount), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: roundCurrency(row.expense_total), amountPaid, paymentDate: row.payment_date || '', balance, status: balance <= 0 ? 'Paid' : row.status || 'Pending', notes: row.notes || '', items: row.items || [], payments, rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
 }
 const invoiceColumns = 'id,date,customer_name,customer_email,customer_phone,customer_id,total_amount,tax_rate,tax_amount,baraf,rickshaw_rent,worker_expense,expense_total,amount_paid,payment_date,balance,status,notes,items,payments,invoice_type';
 function normalizeInvoice(inv) {
@@ -69,12 +71,27 @@ function normalizeInvoice(inv) {
   // use it when the caller does not provide an explicit current total.
   const paymentHistoryTotal = payments.reduce((sum, payment) => sum + Number(payment.appliedAmount ?? payment.amount ?? 0), 0);
   const amountPaidInput = inv.amountPaid ?? inv.amount_paid;
-  const amountPaid = Math.max(0, roundCurrency(amountPaidInput ?? (payments.length ? paymentHistoryTotal : 0)));
+  const amountPaid = roundCurrency(amountPaidInput ?? (payments.length ? paymentHistoryTotal : 0));
   const balance = roundCurrency(totalAmount - amountPaid);
   const status = balance <= 0 ? 'Paid' : inv.status === 'Overdue' ? 'Overdue' : inv.status === 'Unpaid' ? 'Unpaid' : 'Due';
   return { ...inv, totalAmount, taxRate, taxAmount, expenses, expenseTotal, amountPaid, balance, status, items, payments, paymentDate: payments.at(-1)?.date || inv.paymentDate || '' };
 }
 function invoiceParams(inv) { const normalized = normalizeInvoice(inv); return [normalized.id, normalized.date || '', normalized.customerName || '', normalized.customerEmail || '', normalized.customerPhone || '', normalized.customerId || '', normalized.totalAmount, normalized.taxRate, normalized.taxAmount, normalized.expenses.baraf, normalized.expenses.rickshawRent, normalized.expenses.workerExpense, normalized.expenseTotal, normalized.amountPaid, normalized.paymentDate, normalized.balance, normalized.status, normalized.notes || '', JSON.stringify(normalized.items), JSON.stringify(normalized.payments), normalized.invoiceType === 'vendor' ? 'vendor' : 'customer']; }
+function consumeUnappliedCredit(payments, amount) {
+  let remaining = amount;
+  const nextPayments = payments.map((payment) => ({ ...payment }));
+  for (let index = nextPayments.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const payment = nextPayments[index];
+    const paymentAmount = Number(payment.amount || 0);
+    const appliedAmount = Number(payment.appliedAmount ?? payment.amount ?? 0);
+    const unappliedAmount = Math.max(0, paymentAmount - appliedAmount);
+    if (unappliedAmount <= 0) continue;
+    const consumed = Math.min(remaining, unappliedAmount);
+    payment.amount = roundCurrency(paymentAmount - consumed);
+    remaining -= consumed;
+  }
+  return nextPayments.filter((payment) => Number(payment.amount || 0) > 0);
+}
 function contactView(c) { return { id: c.id, type: c.type, fullName: c.full_name, phone: c.phone, email: c.email, companyName: c.company_name, location: c.location, address: c.address, area: c.area, taxRate: Number(c.tax_rate || 0), cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '', cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '', chequeUrl: c.cheque_data || c.cheque_url || '', tempPassword: c.temp_password || '', createdAt: c.created_at }; }
 function adminOnly(user) { return user && user.role === 'admin'; }
 function loginKey(req, email) {
@@ -146,8 +163,9 @@ async function applyPayment(contactId, amount, paymentDate, paymentId) {
           contactPhone: contact.phone || invoice.customer_phone || '',
         });
       }
-      const amountPaid = roundCurrency(Number(invoice.amount_paid || 0) + applied);
-      const balance = roundCurrency(currentBalance - applied);
+      const excessCredit = firstAllocation ? Math.max(0, amount - allocated) : 0;
+      const amountPaid = roundCurrency(Number(invoice.amount_paid || 0) + applied + excessCredit);
+      const balance = roundCurrency(currentBalance - applied - excessCredit);
       await client.query(
         `UPDATE ${table} SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`,
         [amountPaid, paymentDate, balance, balance <= 0 ? 'Paid' : 'Due', JSON.stringify(payments), invoice.id]
@@ -422,7 +440,66 @@ export default async function apiHandler(req, res) {
       const total = Number(countResult.rows[0]?.total || 0);
       return json(res, 200, { invoices: rowsResult.rows.map((row) => invoiceView(row, row.result_invoice_type)), page, limit, total, hasMore: offset + rowsResult.rows.length < total });
     }
-    if (path === '/api/invoices' && method === 'POST') { if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const inv=req.body||{}; const table=inv.invoiceType==='vendor'?'vendor_invoices':'invoices'; const vals=invoiceParams(inv); await query(`INSERT INTO ${table} (${invoiceColumns}) VALUES (${vals.map((_,i)=>`$${i+1}`).join(',')})`, vals); return json(res,201,{success:true}); }
+    if (path === '/api/invoices' && method === 'POST') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const inv = req.body || {};
+      const normalized = normalizeInvoice(inv);
+      const table = normalized.invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const vals = invoiceParams(inv);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(`INSERT INTO ${table} (${invoiceColumns}) VALUES (${vals.map((_, i) => `$${i + 1}`).join(',')})`, vals);
+
+        let newAmountPaid = normalized.amountPaid;
+        let newBalance = normalized.balance;
+        let newPayments = [...normalized.payments];
+        if (normalized.invoiceType !== 'vendor' && normalized.customerId && newBalance > 0) {
+          const creditResult = await client.query(
+            `SELECT id,total_amount,amount_paid,balance,payments FROM invoices WHERE customer_id=$1 AND id<>$2 AND (balance<0 OR total_amount<amount_paid OR total_amount<(SELECT COALESCE(SUM(COALESCE(NULLIF(payment->>'amount','')::numeric,0)),0) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(invoices.payments)='array' THEN invoices.payments ELSE '[]'::jsonb END) payment)) ORDER BY date ASC,id ASC FOR UPDATE`,
+            [normalized.customerId, normalized.id]
+          );
+          for (const creditInvoice of creditResult.rows) {
+            if (newBalance <= 0) break;
+            const paymentHistoryTotal = (Array.isArray(creditInvoice.payments) ? creditInvoice.payments : [])
+              .reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+            const oldPaidTotal = Math.max(Number(creditInvoice.amount_paid || 0), paymentHistoryTotal);
+            const availableCredit = Math.max(0, oldPaidTotal - Number(creditInvoice.total_amount || 0));
+            const adjustment = Math.min(availableCredit, newBalance);
+            if (adjustment <= 0) continue;
+            const oldPayments = Array.isArray(creditInvoice.payments) ? creditInvoice.payments : [];
+            const updatedOldPayments = consumeUnappliedCredit(oldPayments, adjustment);
+            const oldAmountPaid = roundCurrency(oldPaidTotal - adjustment);
+            const oldBalance = roundCurrency(Number(creditInvoice.total_amount || 0) - oldAmountPaid);
+            await client.query(
+              `UPDATE invoices SET amount_paid=$1,balance=$2,status=$3,payments=$4 WHERE id=$5`,
+              [oldAmountPaid, oldBalance, oldBalance <= 0 ? 'Paid' : 'Due', JSON.stringify(updatedOldPayments), creditInvoice.id]
+            );
+            newAmountPaid = roundCurrency(newAmountPaid + adjustment);
+            newBalance = roundCurrency(newBalance - adjustment);
+            newPayments.push({
+              amount: adjustment,
+              appliedAmount: adjustment,
+              date: normalized.date,
+              paymentId: `credit-${creditInvoice.id}-${normalized.id}`,
+              contactName: normalized.customerName || '',
+              contactPhone: normalized.customerPhone || '',
+            });
+          }
+          await client.query(
+            `UPDATE invoices SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`,
+            [newAmountPaid, normalized.date, newBalance, newBalance <= 0 ? 'Paid' : normalized.status, JSON.stringify(newPayments), normalized.id]
+          );
+        }
+        await client.query('COMMIT');
+        return json(res, 201, { success: true, creditApplied: roundCurrency(newAmountPaid - normalized.amountPaid) });
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
     const invoiceMatch = path.match(/^\/api\/invoices\/([^/]+)$/);
     if (invoiceMatch && method === 'PUT') { if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const inv=req.body||{}; const table=inv.invoiceType==='vendor'?'vendor_invoices':'invoices'; const vals=invoiceParams({...inv,id:decodeURIComponent(invoiceMatch[1])}); await query(`UPDATE ${table} SET date=$2,customer_name=$3,customer_email=$4,customer_phone=$5,customer_id=$6,total_amount=$7,tax_rate=$8,tax_amount=$9,baraf=$10,rickshaw_rent=$11,worker_expense=$12,expense_total=$13,amount_paid=$14,payment_date=$15,balance=$16,status=$17,notes=$18,items=$19,payments=$20,invoice_type=$21 WHERE id=$1`, vals); return json(res,200,{success:true}); }
     if (invoiceMatch && method === 'DELETE') { if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const table=new URL(req.url,'http://localhost').searchParams.get('invoiceType')==='vendor'?'vendor_invoices':'invoices'; await query(`DELETE FROM ${table} WHERE id=$1`,[decodeURIComponent(invoiceMatch[1])]); return json(res,200,{success:true}); }
