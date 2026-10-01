@@ -224,6 +224,11 @@ export default async function apiHandler(req, res) {
       await query(`INSERT INTO users(email,password_hash,role) VALUES($1,$2,'admin') ON CONFLICT(email) DO UPDATE SET password_hash=EXCLUDED.password_hash,role='admin'`, [email, await hashPassword(password)]); return json(res, 201, { success: true });
     }
 
+    if (path === '/api/public-invoice-template' && method === 'GET') {
+      const { rows } = await query(`SELECT invoice_template FROM user_settings WHERE invoice_template IS NOT NULL AND invoice_template <> '{}'::jsonb ORDER BY updated_at DESC LIMIT 1`);
+      return json(res, 200, { template: rows[0]?.invoice_template || null });
+    }
+
     const user = await currentUser(req);
     if (path === '/api/dashboard/summary' && method === 'GET') {
       if (!user) return json(res, 401, { error: 'Authentication required' });
