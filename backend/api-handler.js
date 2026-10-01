@@ -371,7 +371,7 @@ export default async function apiHandler(req, res) {
       const { rows } = await query(`
         SELECT COUNT(*)::int AS invoice_count,
           COALESCE(SUM(total_amount),0) AS total_billed,
-          COALESCE(SUM(LEAST(total_amount,GREATEST(amount_paid,0))),0) AS total_paid,
+          COALESCE(SUM(GREATEST(amount_paid,0)),0) AS total_paid,
           COALESCE(SUM(GREATEST(balance,0)),0) AS outstanding,
           COUNT(*) FILTER (WHERE balance <= 0)::int AS settled,
           COUNT(*) FILTER (WHERE balance > 0 AND status='Overdue')::int AS overdue
