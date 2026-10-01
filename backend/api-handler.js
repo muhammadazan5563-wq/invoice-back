@@ -59,11 +59,16 @@ function normalizeInvoice(inv) {
   const items = Array.isArray(inv.items) ? inv.items : [];
   const subtotal = items.length ? items.reduce((sum, item) => sum + Number(item.total || (Number(item.quantity || 0) * Number(item.price || 0))), 0) : Number(inv.subtotal ?? inv.totalAmount ?? 0);
   const taxRate = Number(inv.taxRate || 0);
-  const taxAmount = roundCurrency(subtotal * taxRate / 100);
   const expenses = inv.invoiceType === 'customer' ? { baraf: 0, rickshawRent: 0, workerExpense: 0 } : {
     baraf: Number(inv.expenses?.baraf || 0), rickshawRent: Number(inv.expenses?.rickshawRent || 0), workerExpense: Number(inv.expenses?.workerExpense || 0),
   };
   const expenseTotal = roundCurrency(expenses.baraf + expenses.rickshawRent + expenses.workerExpense);
+  const commissionBase = inv.invoiceType === 'vendor' ? Math.max(0, subtotal - expenseTotal) : subtotal;
+  const calculatedTaxAmount = commissionBase * taxRate / 100;
+  const suppliedTaxAmount = inv.taxAmount ?? inv.tax_amount;
+  const taxAmount = suppliedTaxAmount === undefined || suppliedTaxAmount === null
+    ? roundCurrency(calculatedTaxAmount)
+    : roundCurrency(Number(suppliedTaxAmount));
   const totalAmount = roundCurrency(subtotal + taxAmount + expenseTotal);
   const payments = (Array.isArray(inv.payments) ? inv.payments : []).filter((payment) => Number(payment.amount || 0) > 0);
   // The editor's current amountPaid is authoritative. Payment history can
