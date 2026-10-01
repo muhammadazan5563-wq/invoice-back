@@ -69,7 +69,7 @@ function normalizeInvoice(inv) {
   const taxAmount = suppliedTaxAmount === undefined || suppliedTaxAmount === null
     ? roundCurrency(calculatedTaxAmount)
     : roundCurrency(Number(suppliedTaxAmount));
-  const totalAmount = roundCurrency(subtotal + taxAmount + expenseTotal);
+  const totalAmount = roundCurrency(subtotal + taxAmount - expenseTotal);
   const payments = (Array.isArray(inv.payments) ? inv.payments : []).filter((payment) => Number(payment.amount || 0) > 0);
   // The editor's current amountPaid is authoritative. Payment history can
   // contain legacy appliedAmount metadata from an earlier allocation, so only
