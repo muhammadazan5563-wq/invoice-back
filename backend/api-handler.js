@@ -228,7 +228,8 @@ async function dashboardSummary(user, today, mode = 'customer') {
     )
     SELECT COUNT(*)::int AS total_invoices,
       COALESCE(SUM(total_amount),0) AS total_revenue,
-      COALESCE(SUM(LEAST(total_amount,GREATEST(amount_paid,0))),0) AS total_paid,
+      COALESCE(SUM(GREATEST(amount_paid,0)),0) AS total_paid,
+      COALESCE(SUM(GREATEST(amount_paid-total_amount,0)),0) AS total_overpaid,
       COALESCE(SUM(GREATEST(balance,0)),0) AS total_pending,
       COUNT(*) FILTER (WHERE status='Paid')::int AS paid_count,
       COUNT(*) FILTER (WHERE status IN ('Pending','Due'))::int AS pending_count,
@@ -241,7 +242,25 @@ async function dashboardSummary(user, today, mode = 'customer') {
       COUNT(*) FILTER (WHERE status='Pending' AND date=${todayParam})::int AS today_pending_count
     FROM combined`, args);
   const r = rows[0] || {};
-  return { totalInvoices: Number(r.total_invoices || 0), totalRevenue: Number(r.total_revenue || 0), totalPaid: Number(r.total_paid || 0), totalPending: Number(r.total_pending || 0), paidCount: Number(r.paid_count || 0), pendingCount: Number(r.pending_count || 0), overdueCount: Number(r.overdue_count || 0), overdueAmount: Number(r.overdue_amount || 0), dueAmount: Number(r.due_amount || 0), averageInvoice: Number(r.average_invoice || 0), todayCollection: Number(r.today_collection || 0), todayPaidCount: Number(r.today_paid_count || 0), todayPendingCount: Number(r.today_pending_count || 0) };
+  return { totalInvoices: Number(r.total_invoices || 0), totalRevenue: Number(r.total_revenue || 0), totalPaid: Number(r.total_paid || 0), totalOverpaid: Number(r.total_overpaid || 0), totalPending: Number(r.total_pending || 0), paidCount: Number(r.paid_count || 0), pendingCount: Number(r.pending_count || 0), overdueCount: Number(r.overdue_count || 0), overdueAmount: Number(r.overdue_amount || 0), dueAmount: Number(r.due_amount || 0), averageInvoice: Number(r.average_invoice || 0), todayCollection: Number(r.today_collection || 0), todayPaidCount: Number(r.today_paid_count || 0), todayPendingCount: Number(r.today_pending_count || 0) };
+}
+
+async function nextInvoiceId() {
+  const yearPrefix = String(new Date().getFullYear()).slice(-2);
+  const prefix = `INV-${yearPrefix}`;
+  const { rows } = await query(
+    `SELECT id FROM (
+       SELECT id FROM invoices WHERE id LIKE $1
+       UNION ALL
+       SELECT id FROM vendor_invoices WHERE id LIKE $1
+     ) all_invoices
+     WHERE id ~ $2
+     ORDER BY substring(id FROM 5)::bigint DESC
+     LIMIT 1`,
+    [`${prefix}%`, `^${prefix}[0-9]+$`]
+  );
+  const highest = rows[0]?.id ? Number(String(rows[0].id).slice(prefix.length)) : 0;
+  return `${prefix}${String((Number.isFinite(highest) ? highest : 0) + 1).padStart(3, '0')}`;
 }
 
 export default async function apiHandler(req, res) {
@@ -279,6 +298,10 @@ export default async function apiHandler(req, res) {
     }
 
     const user = await currentUser(req);
+    if (path === '/api/invoices/next-id' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      return json(res, 200, { id: await nextInvoiceId() });
+    }
     if (path === '/api/dashboard/summary' && method === 'GET') {
       if (!user) return json(res, 401, { error: 'Authentication required' });
       const params = new URL(req.url, 'http://localhost').searchParams;
@@ -354,10 +377,11 @@ export default async function apiHandler(req, res) {
       const summary = invoices.reduce((result, invoice) => ({
         billed: result.billed + invoice.totalAmount,
         paid: result.paid + Math.max(invoice.amountPaid, 0),
+        overpaid: result.overpaid + Math.max(-invoice.balance, 0),
         outstanding: result.outstanding + Math.max(invoice.balance, 0),
         settled: result.settled + (invoice.balance <= 0 ? 1 : 0),
         overdue: result.overdue + (invoice.balance > 0 && invoice.status === 'Overdue' ? 1 : 0),
-      }), { billed: 0, paid: 0, outstanding: 0, settled: 0, overdue: 0 });
+      }), { billed: 0, paid: 0, overpaid: 0, outstanding: 0, settled: 0, overdue: 0 });
       return json(res, 200, { invoices, total: invoices.length, summary });
     }
     if (path === '/api/contact-summary' && method === 'GET') {
@@ -377,12 +401,13 @@ export default async function apiHandler(req, res) {
         SELECT COUNT(*)::int AS invoice_count,
           COALESCE(SUM(total_amount),0) AS total_billed,
           COALESCE(SUM(GREATEST(amount_paid,0)),0) AS total_paid,
+          COALESCE(SUM(GREATEST(amount_paid-total_amount,0)),0) AS total_overpaid,
           COALESCE(SUM(GREATEST(balance,0)),0) AS outstanding,
           COUNT(*) FILTER (WHERE balance <= 0)::int AS settled,
           COUNT(*) FILTER (WHERE balance > 0 AND status='Overdue')::int AS overdue
         FROM ${table} WHERE customer_id=$1`, [contactId]);
       const row = rows[0] || {};
-      return json(res, 200, { billed: Number(row.total_billed || 0), paid: Number(row.total_paid || 0), outstanding: Number(row.outstanding || 0), settled: Number(row.settled || 0), overdue: Number(row.overdue || 0), invoiceCount: Number(row.invoice_count || 0) });
+      return json(res, 200, { billed: Number(row.total_billed || 0), paid: Number(row.total_paid || 0), overpaid: Number(row.total_overpaid || 0), outstanding: Number(row.outstanding || 0), settled: Number(row.settled || 0), overdue: Number(row.overdue || 0), invoiceCount: Number(row.invoice_count || 0) });
     }
     if (path === '/api/invoices/expenses' && method === 'GET') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
@@ -477,10 +502,14 @@ export default async function apiHandler(req, res) {
         if (status === 'Paid') conditions.push('balance <= 0');
         else conditions.push(`status=${addParam(status)}`);
       }
-      const fromMonth = url.searchParams.get('fromMonth');
-      if (fromMonth) conditions.push(`date >= ${addParam(`${fromMonth}-01`)}`);
-      const toMonth = url.searchParams.get('toMonth');
-      if (toMonth) conditions.push(`date < (${addParam(`${toMonth}-01`)}::date + INTERVAL '1 month')::text`);
+      const fromDate = url.searchParams.get('fromDate') || url.searchParams.get('fromMonth');
+      if (fromDate) conditions.push(`date >= ${addParam(fromDate.length === 7 ? `${fromDate}-01` : fromDate)}`);
+      const toDate = url.searchParams.get('toDate') || url.searchParams.get('toMonth');
+      if (toDate) {
+        conditions.push(toDate.length === 7
+          ? `date < (${addParam(`${toDate}-01`)}::date + INTERVAL '1 month')::text`
+          : `date <= ${addParam(toDate)}`);
+      }
       const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
       const union = tables.map(({ name, type }) => `SELECT ${invoiceColumns}, created_at, '${type}' AS result_invoice_type FROM ${name}${where}`).join(' UNION ALL ');
       const limitParam = addParam(limit);
