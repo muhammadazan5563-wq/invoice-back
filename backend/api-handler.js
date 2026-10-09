@@ -99,13 +99,14 @@ function consumeUnappliedCredit(payments, amount) {
   return nextPayments.filter((payment) => Number(payment.amount || 0) > 0);
 }
 function contactView(c) { return { id: c.id, type: c.type, fullName: c.full_name, phone: c.phone, email: c.email, companyName: c.company_name, location: c.location, address: c.address, area: c.area, taxRate: Number(c.tax_rate || 0), cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '', cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '', chequeUrl: c.cheque_data || c.cheque_url || '', tempPassword: c.temp_password || '', createdAt: c.created_at }; }
-async function applyCustomerCredit(client, normalized) {
+async function applyInvoiceCredit(client, normalized) {
   let newAmountPaid = normalized.amountPaid;
   let newBalance = normalized.balance;
   let newPayments = [...normalized.payments];
-  if (normalized.invoiceType === 'vendor' || !normalized.customerId || newBalance <= 0) return { amountPaid: newAmountPaid, balance: newBalance, payments: newPayments, applied: 0 };
+  if (!normalized.customerId || newBalance <= 0) return { amountPaid: newAmountPaid, balance: newBalance, payments: newPayments, applied: 0 };
+  const table = normalized.invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
   const creditResult = await client.query(
-    `SELECT id,total_amount,amount_paid,balance,payments FROM invoices WHERE customer_id=$1 AND id<>$2 AND (balance<0 OR total_amount<amount_paid OR total_amount<(SELECT COALESCE(SUM(COALESCE(NULLIF(payment->>'amount','')::numeric,0)),0) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(invoices.payments)='array' THEN invoices.payments ELSE '[]'::jsonb END) payment)) ORDER BY date ASC,id ASC FOR UPDATE`,
+    `SELECT id,total_amount,amount_paid,balance,payments FROM ${table} WHERE customer_id=$1 AND id<>$2 AND (balance<0 OR total_amount<amount_paid OR total_amount<(SELECT COALESCE(SUM(COALESCE(NULLIF(payment->>'amount','')::numeric,0)),0) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(${table}.payments)='array' THEN ${table}.payments ELSE '[]'::jsonb END) payment)) ORDER BY date ASC,id ASC FOR UPDATE`,
     [normalized.customerId, normalized.id]
   );
   for (const creditInvoice of creditResult.rows) {
@@ -117,7 +118,7 @@ async function applyCustomerCredit(client, normalized) {
     const updatedOldPayments = consumeUnappliedCredit(Array.isArray(creditInvoice.payments) ? creditInvoice.payments : [], adjustment);
     const oldAmountPaid = roundCurrency(oldPaidTotal - adjustment);
     const oldBalance = roundCurrency(Number(creditInvoice.total_amount || 0) - oldAmountPaid);
-    await client.query(`UPDATE invoices SET amount_paid=$1,balance=$2,status=$3,payments=$4 WHERE id=$5`, [oldAmountPaid, oldBalance, oldBalance <= 0 ? 'Paid' : 'Due', JSON.stringify(updatedOldPayments), creditInvoice.id]);
+    await client.query(`UPDATE ${table} SET amount_paid=$1,balance=$2,status=$3,payments=$4 WHERE id=$5`, [oldAmountPaid, oldBalance, oldBalance <= 0 ? 'Paid' : 'Due', JSON.stringify(updatedOldPayments), creditInvoice.id]);
     newAmountPaid = roundCurrency(newAmountPaid + adjustment);
     newBalance = roundCurrency(newBalance - adjustment);
     newPayments.push({ amount: adjustment, appliedAmount: adjustment, date: normalized.date, paymentId: `credit-${creditInvoice.id}-${normalized.id}`, contactName: normalized.customerName || '', contactPhone: normalized.customerPhone || '' });
@@ -535,9 +536,9 @@ export default async function apiHandler(req, res) {
         let newAmountPaid = normalized.amountPaid;
         let newBalance = normalized.balance;
         let newPayments = [...normalized.payments];
-        if (normalized.invoiceType !== 'vendor' && normalized.customerId && newBalance > 0) {
+        if (normalized.customerId && newBalance > 0) {
           const creditResult = await client.query(
-            `SELECT id,total_amount,amount_paid,balance,payments FROM invoices WHERE customer_id=$1 AND id<>$2 AND (balance<0 OR total_amount<amount_paid OR total_amount<(SELECT COALESCE(SUM(COALESCE(NULLIF(payment->>'amount','')::numeric,0)),0) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(invoices.payments)='array' THEN invoices.payments ELSE '[]'::jsonb END) payment)) ORDER BY date ASC,id ASC FOR UPDATE`,
+            `SELECT id,total_amount,amount_paid,balance,payments FROM ${table} WHERE customer_id=$1 AND id<>$2 AND (balance<0 OR total_amount<amount_paid OR total_amount<(SELECT COALESCE(SUM(COALESCE(NULLIF(payment->>'amount','')::numeric,0)),0) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(${table}.payments)='array' THEN ${table}.payments ELSE '[]'::jsonb END) payment)) ORDER BY date ASC,id ASC FOR UPDATE`,
             [normalized.customerId, normalized.id]
           );
           for (const creditInvoice of creditResult.rows) {
@@ -553,7 +554,7 @@ export default async function apiHandler(req, res) {
             const oldAmountPaid = roundCurrency(oldPaidTotal - adjustment);
             const oldBalance = roundCurrency(Number(creditInvoice.total_amount || 0) - oldAmountPaid);
             await client.query(
-              `UPDATE invoices SET amount_paid=$1,balance=$2,status=$3,payments=$4 WHERE id=$5`,
+              `UPDATE ${table} SET amount_paid=$1,balance=$2,status=$3,payments=$4 WHERE id=$5`,
               [oldAmountPaid, oldBalance, oldBalance <= 0 ? 'Paid' : 'Due', JSON.stringify(updatedOldPayments), creditInvoice.id]
             );
             newAmountPaid = roundCurrency(newAmountPaid + adjustment);
@@ -568,7 +569,7 @@ export default async function apiHandler(req, res) {
             });
           }
           await client.query(
-            `UPDATE invoices SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`,
+            `UPDATE ${table} SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`,
             [newAmountPaid, normalized.date, newBalance, newBalance <= 0 ? 'Paid' : normalized.status, JSON.stringify(newPayments), normalized.id]
           );
         }
@@ -592,9 +593,9 @@ export default async function apiHandler(req, res) {
         await client.query('BEGIN');
         const vals = invoiceParams(normalized);
         await client.query(`UPDATE ${table} SET date=$2,customer_name=$3,customer_email=$4,customer_phone=$5,customer_id=$6,total_amount=$7,tax_rate=$8,tax_amount=$9,baraf=$10,rickshaw_rent=$11,worker_expense=$12,expense_total=$13,amount_paid=$14,payment_date=$15,balance=$16,status=$17,notes=$18,items=$19,payments=$20,invoice_type=$21 WHERE id=$1`, vals);
-        const adjusted = await applyCustomerCredit(client, normalized);
+        const adjusted = await applyInvoiceCredit(client, normalized);
         if (adjusted.applied > 0) {
-          await client.query(`UPDATE invoices SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`, [adjusted.amountPaid, normalized.date, adjusted.balance, adjusted.balance <= 0 ? 'Paid' : normalized.status, JSON.stringify(adjusted.payments), normalized.id]);
+          await client.query(`UPDATE ${table} SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`, [adjusted.amountPaid, normalized.date, adjusted.balance, adjusted.balance <= 0 ? 'Paid' : normalized.status, JSON.stringify(adjusted.payments), normalized.id]);
         }
         await client.query('COMMIT');
         return json(res, 200, { success: true, creditApplied: adjusted.applied });
