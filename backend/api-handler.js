@@ -55,6 +55,7 @@ function invoiceView(row, type) {
   return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount, taxRate: Number(row.tax_rate || 0), taxAmount: roundCurrency(row.tax_amount), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: roundCurrency(row.expense_total), amountPaid, paymentDate: row.payment_date || '', balance, status: balance <= 0 ? 'Paid' : row.status || 'Pending', notes: row.notes || '', items: row.items || [], payments, rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
 }
 const invoiceColumns = 'id,date,customer_name,customer_email,customer_phone,customer_id,total_amount,tax_rate,tax_amount,baraf,rickshaw_rent,worker_expense,expense_total,amount_paid,payment_date,balance,status,notes,items,payments,invoice_type';
+const invoiceListColumns = 'id,date,customer_name,customer_email,customer_phone,customer_id,total_amount,tax_rate,tax_amount,baraf,rickshaw_rent,worker_expense,expense_total,amount_paid,payment_date,balance,status,invoice_type';
 function normalizeInvoice(inv) {
   const items = Array.isArray(inv.items) ? inv.items : [];
   const subtotal = items.length ? items.reduce((sum, item) => sum + Number(item.total || (Number(item.quantity || 0) * Number(item.price || 0))), 0) : Number(inv.subtotal ?? inv.totalAmount ?? 0);
@@ -98,7 +99,20 @@ function consumeUnappliedCredit(payments, amount) {
   }
   return nextPayments.filter((payment) => Number(payment.amount || 0) > 0);
 }
-function contactView(c) { return { id: c.id, type: c.type, fullName: c.full_name, phone: c.phone, email: c.email, companyName: c.company_name, location: c.location, address: c.address, area: c.area, taxRate: Number(c.tax_rate || 0), cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '', cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '', chequeUrl: c.cheque_data || c.cheque_url || '', tempPassword: c.temp_password || '', createdAt: c.created_at }; }
+function contactView(c, includeDocuments = false) {
+  return {
+    id: c.id, type: c.type, fullName: c.full_name || '', phone: c.phone || '', email: c.email || '',
+    companyName: c.company_name || '', location: c.location || '', address: c.address || '', area: c.area || '',
+    taxRate: Number(c.tax_rate || 0),
+    ...(includeDocuments ? {
+      cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '',
+      cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '',
+      chequeUrl: c.cheque_data || c.cheque_url || '',
+      tempPassword: c.temp_password || '',
+    } : {}),
+    createdAt: c.created_at,
+  };
+}
 async function applyInvoiceCredit(client, normalized) {
   let newAmountPaid = normalized.amountPaid;
   let newBalance = normalized.balance;
@@ -303,19 +317,30 @@ async function dashboardSummary(user, today, mode = 'customer') {
 async function nextInvoiceId() {
   const yearPrefix = String(new Date().getFullYear()).slice(-2);
   const prefix = `INV-${yearPrefix}`;
-  const { rows } = await query(
-    `SELECT id FROM (
-       SELECT id FROM invoices WHERE id LIKE $1
-       UNION ALL
-       SELECT id FROM vendor_invoices WHERE id LIKE $1
-     ) all_invoices
-     WHERE id ~ $2
-     ORDER BY substring(id FROM 5)::bigint DESC
-     LIMIT 1`,
-    [`${prefix}%`, `^${prefix}[0-9]+$`]
-  );
-  const highest = rows[0]?.id ? Number(String(rows[0].id).slice(prefix.length)) : 0;
-  return `${prefix}${String((Number.isFinite(highest) ? highest : 0) + 1).padStart(3, '0')}`;
+  const { rows } = await query(`
+    SELECT COALESCE(MAX(number_value), 0) AS highest FROM (
+      SELECT NULLIF(substring(id FROM length($1) + 1), '')::bigint AS number_value FROM invoices WHERE id ~ $2
+      UNION ALL
+      SELECT NULLIF(substring(id FROM length($1) + 1), '')::bigint AS number_value FROM vendor_invoices WHERE id ~ $2
+    ) numbers`, [prefix, `^${prefix}[0-9]+$`]);
+  return `${prefix}${String(Number(rows[0]?.highest || 0) + 1).padStart(3, '0')}`;
+}
+async function reserveInvoiceId(client) {
+  const yearPrefix = String(new Date().getFullYear()).slice(-2);
+  const prefix = `INV-${yearPrefix}`;
+  const pattern = `^${prefix}[0-9]+$`;
+  await client.query(`
+    INSERT INTO invoice_counters(prefix, next_number)
+    SELECT $1, GREATEST(1, COALESCE(MAX(number_value), 0) + 1) FROM (
+      SELECT NULLIF(substring(id FROM length($1) + 1), '')::bigint AS number_value FROM invoices WHERE id ~ $2
+      UNION ALL
+      SELECT NULLIF(substring(id FROM length($1) + 1), '')::bigint AS number_value FROM vendor_invoices WHERE id ~ $2
+    ) numbers
+    ON CONFLICT(prefix) DO NOTHING`, [prefix, pattern]);
+  const { rows } = await client.query('SELECT next_number FROM invoice_counters WHERE prefix=$1 FOR UPDATE', [prefix]);
+  const next = Number(rows[0]?.next_number || 1);
+  await client.query('UPDATE invoice_counters SET next_number=$2 WHERE prefix=$1', [prefix, next + 1]);
+  return `${prefix}${String(next).padStart(3, '0')}`;
 }
 
 export default async function apiHandler(req, res) {
@@ -405,39 +430,30 @@ export default async function apiHandler(req, res) {
     }
     if (path === '/api/invoices/history' && method === 'GET') {
       if (!user) return json(res, 401, { error: 'Authentication required' });
-      const url = new URL(req.url, 'http://localhost');
-      const contactId = url.searchParams.get('customerId')?.trim();
+      const url = new URL(req.url, 'http://localhost'); const contactId = url.searchParams.get('customerId')?.trim();
       const invoiceType = url.searchParams.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
       if (!contactId) return json(res, 400, { error: 'customerId is required' });
       if (!adminOnly(user)) {
         const expectedType = user.role === 'vendor' ? 'vendor' : 'customer';
-        if (user.contact_id !== contactId || expectedType !== invoiceType) {
-          return json(res, 403, { error: 'You may only access your own invoice history' });
-        }
+        if (user.contact_id !== contactId || expectedType !== invoiceType) return json(res, 403, { error: 'You may only access your own invoice history' });
       }
-      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
-      const args = [contactId];
-      const conditions = ['customer_id=$1'];
-      const addParam = (value) => { args.push(value); return `$${args.length}`; };
+      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices'; const args = [contactId];
+      const conditions = ['customer_id=$1']; const addParam = (value) => { args.push(value); return `$${args.length}`; };
       const status = url.searchParams.get('status');
       if (status && status !== 'all' && status !== 'All') conditions.push(status === 'Paid' ? 'balance <= 0' : `status=${addParam(status)}`);
-      const fromDate = url.searchParams.get('fromDate');
-      if (fromDate) conditions.push(`date >= ${addParam(fromDate)}`);
-      const toDate = url.searchParams.get('toDate');
-      if (toDate) conditions.push(`date <= ${addParam(toDate)}`);
-      const search = url.searchParams.get('search')?.trim();
-      if (search) { const param = addParam(`%${search}%`); conditions.push(`id ILIKE ${param}`); }
-      const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC`, args);
-      const invoices = rows.map((row) => invoiceView(row, invoiceType));
-      const summary = invoices.reduce((result, invoice) => ({
-        billed: result.billed + invoice.totalAmount,
-        paid: result.paid + Math.max(invoice.amountPaid, 0),
-        overpaid: result.overpaid + Math.max(-invoice.balance, 0),
-        outstanding: result.outstanding + Math.max(invoice.balance, 0),
-        settled: result.settled + (invoice.balance <= 0 ? 1 : 0),
-        overdue: result.overdue + (invoice.balance > 0 && invoice.status === 'Overdue' ? 1 : 0),
-      }), { billed: 0, paid: 0, overpaid: 0, outstanding: 0, settled: 0, overdue: 0 });
-      return json(res, 200, { invoices, total: invoices.length, summary });
+      const fromDate = url.searchParams.get('fromDate'); if (fromDate) conditions.push(`date >= ${addParam(fromDate)}`);
+      const toDate = url.searchParams.get('toDate'); if (toDate) conditions.push(`date <= ${addParam(toDate)}`);
+      const search = url.searchParams.get('search')?.trim(); if (search) { const param = addParam(`%${search}%`); conditions.push(`(id ILIKE ${param} OR customer_name ILIKE ${param} OR customer_email ILIKE ${param})`); }
+      const where = conditions.join(' AND '); const page = Math.max(1, Number(url.searchParams.get('page') || 1)); const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 500))); const offset = (page - 1) * limit;
+      const [rowsResult, countResult, summaryResult] = await Promise.all([
+        query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`, [...args, limit, offset]),
+        query(`SELECT COUNT(*)::int AS total FROM ${table} WHERE ${where}`, args),
+        query(`SELECT COALESCE(SUM(total_amount),0) AS billed, COALESCE(SUM(GREATEST(amount_paid,0)),0) AS paid, COALESCE(SUM(GREATEST(-balance,0)),0) AS overpaid, COALESCE(SUM(GREATEST(balance,0)),0) AS outstanding, COUNT(*) FILTER (WHERE balance <= 0)::int AS settled, COUNT(*) FILTER (WHERE balance > 0 AND status='Overdue')::int AS overdue FROM ${table} WHERE ${where}`, args),
+      ]);
+      const total = Number(countResult.rows[0]?.total || 0); const summaryRow = summaryResult.rows[0] || {};
+      const summary = { billed: Number(summaryRow.billed || 0), paid: Number(summaryRow.paid || 0), overpaid: Number(summaryRow.overpaid || 0), outstanding: Number(summaryRow.outstanding || 0), settled: Number(summaryRow.settled || 0), overdue: Number(summaryRow.overdue || 0), invoiceCount: total };
+      const invoices = rowsResult.rows.map((row) => invoiceView(row, invoiceType));
+      return json(res, 200, { invoices, page, limit, total, hasMore: offset + invoices.length < total, summary });
     }
     if (path === '/api/contact-summary' && method === 'GET') {
       if (!user) return json(res, 401, { error: 'Authentication required' });
@@ -555,14 +571,23 @@ export default async function apiHandler(req, res) {
       }).sort((a, b) => (parseInt(a.id.replace(/\D/g, ''), 10) || 0) - (parseInt(b.id.replace(/\D/g, ''), 10) || 0));
       return json(res, 200, { invoices: rows, total: rows.length });
     }
-    if (path === '/api/contacts' && method === 'GET') { if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const { rows } = await query('SELECT * FROM contacts ORDER BY created_at DESC'); return json(res, 200, rows.map(contactView)); }
+    if (path === '/api/contacts' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const { rows } = await query('SELECT id,type,full_name,phone,email,company_name,location,address,area,tax_rate,created_at FROM contacts ORDER BY created_at DESC');
+      return json(res, 200, rows.map((row) => contactView(row)));
+    }
     if (path === '/api/contacts' && method === 'POST') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const d = req.body || {}; const email = emailOf(d.email); const password = String(d.password || randomBytes(9).toString('base64url'));
       if (!d.fullName || !email || password.length < 6) return json(res, 400, { error: 'Full name, email and a 6+ character password are required' });
       const { rows } = await query(`INSERT INTO contacts(type,full_name,phone,email,company_name,location,address,area,tax_rate,temp_password,cnic_front_data,cnic_back_data,cheque_data) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`, [d.type === 'vendor' ? 'vendor' : 'customer', d.fullName.trim(), d.phone || '', email, d.companyName || '', d.location || '', d.address || '', d.area || '', Number(d.taxRate || 0), password, d.cnicFrontData || '', d.cnicBackData || '', d.chequeData || '']);
-      const c = rows[0]; await query('INSERT INTO users(email,password_hash,role,contact_id) VALUES($1,$2,$3,$4)', [email, await hashPassword(password), c.type, c.id]); return json(res, 201, { contact: contactView(c), password });
+      const c = rows[0]; await query('INSERT INTO users(email,password_hash,role,contact_id) VALUES($1,$2,$3,$4)', [email, await hashPassword(password), c.type, c.id]); return json(res, 201, { contact: contactView(c, true), password });
     }
     const contactMatch = path.match(/^\/api\/contacts\/([^/]+)$/);
+    if (contactMatch && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const { rows } = await query('SELECT * FROM contacts WHERE id=$1 LIMIT 1', [contactMatch[1]]);
+      return rows[0] ? json(res, 200, contactView(rows[0], true)) : json(res, 404, { error: 'Contact not found' });
+    }
     if (contactMatch && method === 'PUT') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const d = req.body || {};
@@ -576,7 +601,7 @@ export default async function apiHandler(req, res) {
       } else {
         await query('UPDATE users SET email=$1 WHERE contact_id=$2', [email, contactMatch[1]]);
       }
-      return json(res, 200, contactView(rows[0]));
+      return json(res, 200, contactView(rows[0], true));
     }
 
     if (path === '/api/invoices' && method === 'GET') {
@@ -616,7 +641,7 @@ export default async function apiHandler(req, res) {
           : `date <= ${addParam(toDate)}`);
       }
       const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
-      const union = tables.map(({ name, type }) => `SELECT ${invoiceColumns}, created_at, '${type}' AS result_invoice_type FROM ${name}${where}`).join(' UNION ALL ');
+      const union = tables.map(({ name, type }) => `SELECT ${invoiceListColumns}, created_at, '${type}' AS result_invoice_type FROM ${name}${where}`).join(' UNION ALL ');
       const limitParam = addParam(limit);
       const offsetParam = addParam(offset);
       const [rowsResult, countResult] = await Promise.all([
@@ -626,15 +651,23 @@ export default async function apiHandler(req, res) {
       const total = Number(countResult.rows[0]?.total || 0);
       return json(res, 200, { invoices: rowsResult.rows.map((row) => invoiceView(row, row.result_invoice_type)), page, limit, total, hasMore: offset + rowsResult.rows.length < total });
     }
+    const invoiceDetailMatch = path.match(/^\/api\/invoices\/([^/]+)$/);
+    if (invoiceDetailMatch && method === 'GET') {
+      if (!user) return json(res, 401, { error: 'Authentication required' });
+      const id = decodeURIComponent(invoiceDetailMatch[1]); const invoiceType = new URL(req.url, 'http://localhost').searchParams.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
+      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices'; const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE id=$1 LIMIT 1`, [id]);
+      return rows[0] ? json(res, 200, invoiceView(rows[0], invoiceType)) : json(res, 404, { error: 'Invoice not found' });
+    }
     if (path === '/api/invoices' && method === 'POST') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const inv = req.body || {};
-      const normalized = normalizeInvoice(inv);
-      const table = normalized.invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
-      const vals = invoiceParams(inv);
+      const table = inv.invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+        const allocatedId = await reserveInvoiceId(client);
+        const normalized = normalizeInvoice({ ...inv, id: allocatedId });
+        const vals = invoiceParams(normalized);
         await client.query(`INSERT INTO ${table} (${invoiceColumns}) VALUES (${vals.map((_, i) => `$${i + 1}`).join(',')})`, vals);
 
         const adjusted = await applyInvoiceCredit(client, normalized);
@@ -646,7 +679,7 @@ export default async function apiHandler(req, res) {
         }
         await syncInvoicePayments(client, { ...normalized, amountPaid: adjusted.amountPaid, balance: adjusted.balance, payments: adjusted.payments });
         await client.query('COMMIT');
-        return json(res, 201, { success: true, creditApplied: adjusted.applied });
+        return json(res, 201, { success: true, id: normalized.id, creditApplied: adjusted.applied });
       } catch (error) {
         await client.query('ROLLBACK');
         throw error;
@@ -736,10 +769,30 @@ export default async function apiHandler(req, res) {
       } finally { client.release(); }
     }
     if (path === '/api/ledger-invoices' && method === 'GET') {
-      const {rows}=await query(`SELECT ledger_invoices.id,ledger_invoices.ledger_date,ledger_invoices.created_at,invoice.invoice_id,invoice.guest_name,invoice.hotel_name,invoice.total_amount,invoice.invoice_type FROM ledger_invoices CROSS JOIN LATERAL jsonb_to_recordset(ledger_invoices.invoices) AS invoice(invoice_id TEXT,guest_name TEXT,hotel_name TEXT,total_amount NUMERIC,invoice_type TEXT) ORDER BY ledger_invoices.ledger_date DESC`);
-      return json(res,200,rows.map((row) => ({ id: `${row.invoice_id}_${row.ledger_date}`, invoice_id: row.invoice_id, ledger_date: row.ledger_date, guest_name: row.guest_name, hotel_name: row.hotel_name, total_amount: Number(row.total_amount || 0), invoice_type: row.invoice_type === 'vendor' ? 'vendor' : 'customer', created_at: row.created_at })));
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const url = new URL(req.url, 'http://localhost');
+      const page = Math.max(1, Number(url.searchParams.get('page') || 1));
+      const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit') || 300)));
+      const fromDate = url.searchParams.get('fromDate')?.trim(); const toDate = url.searchParams.get('toDate')?.trim();
+      const conditions = []; const args = []; const add = (value) => { args.push(value); return `$${args.length}`; };
+      if (fromDate) conditions.push(`ledger_date >= ${add(fromDate)}`); if (toDate) conditions.push(`ledger_date <= ${add(toDate)}`);
+      const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+      const base = `FROM ledger_invoices CROSS JOIN LATERAL jsonb_to_recordset(ledger_invoices.invoices) AS invoice(invoice_id TEXT,guest_name TEXT,hotel_name TEXT,total_amount NUMERIC,invoice_type TEXT) ${where}`;
+      const count = await query(`SELECT COUNT(*)::int AS total ${base}`, args);
+      const rows = await query(`SELECT ledger_invoices.id,ledger_invoices.ledger_date,ledger_invoices.created_at,invoice.invoice_id,invoice.guest_name,invoice.hotel_name,invoice.total_amount,invoice.invoice_type ${base} ORDER BY ledger_invoices.ledger_date DESC, ledger_invoices.created_at DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`, [...args, limit, (page - 1) * limit]);
+      const mapped = rows.rows.map((row) => ({ id: `${row.invoice_id}_${row.ledger_date}`, invoice_id: row.invoice_id, ledger_date: row.ledger_date, guest_name: row.guest_name, hotel_name: row.hotel_name, total_amount: Number(row.total_amount || 0), invoice_type: row.invoice_type === 'vendor' ? 'vendor' : 'customer', created_at: row.created_at }));
+      const total = Number(count.rows[0]?.total || 0); return json(res,200,{ invoices: mapped, page, limit, total, hasMore: (page - 1) * limit + mapped.length < total });
     }
-    if (path === '/api/cash-expenses' && method === 'GET') { const {rows}=await query('SELECT * FROM cash_expenses ORDER BY created_at DESC'); return json(res,200,rows); }
+    if (path === '/api/cash-expenses' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const url = new URL(req.url, 'http://localhost'); const page = Math.max(1, Number(url.searchParams.get('page') || 1));
+      const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit') || 300))); const fromDate = url.searchParams.get('fromDate')?.trim(); const toDate = url.searchParams.get('toDate')?.trim();
+      const conditions = []; const args = []; const add = (value) => { args.push(value); return `$${args.length}`; };
+      if (fromDate) conditions.push(`created_at >= ${add(fromDate)}::date`); if (toDate) conditions.push(`created_at < (${add(toDate)}::date + INTERVAL '1 day')`);
+      const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''; const count = await query(`SELECT COUNT(*)::int AS total FROM cash_expenses ${where}`, args);
+      const rows = await query(`SELECT id,name,amount,description,tag,created_at FROM cash_expenses ${where} ORDER BY created_at DESC,id DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`, [...args, limit, (page - 1) * limit]);
+      const total = Number(count.rows[0]?.total || 0); return json(res,200,{ expenses: rows.rows, page, limit, total, hasMore: (page - 1) * limit + rows.rows.length < total });
+    }
     if (path === '/api/ledger-invoices' && method === 'POST') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); return json(res,410,{error:'Use POST /api/ledger/bulk instead'}); }
     if (path === '/api/cash-expenses' && method === 'POST') { if(!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const x=req.body||{}; await query('INSERT INTO cash_expenses(name,amount,description,tag) VALUES($1,$2,$3,$4)',[x.name,Number(x.amount||0),x.description||'',x.tag||'expense']); return json(res,201,{success:true}); }
     if (path.startsWith('/api/ledger-invoices/') && method === 'DELETE') {
