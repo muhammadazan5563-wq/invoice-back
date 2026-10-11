@@ -119,6 +119,15 @@ async function applyInvoiceCredit(client, normalized) {
     const updatedOldBalance = roundCurrency(oldBalance + adjustment);
     const oldAmountPaid = roundCurrency(Number(creditInvoice.total_amount || 0) - updatedOldBalance);
     await client.query(`UPDATE ${table} SET amount_paid=$1,balance=$2,status=$3,payments=$4 WHERE id=$5`, [oldAmountPaid, updatedOldBalance, updatedOldBalance <= 0 ? 'Paid' : 'Due', JSON.stringify(updatedOldPayments), creditInvoice.id]);
+    await syncInvoicePayments(client, {
+      id: creditInvoice.id,
+      invoiceType: normalized.invoiceType,
+      customerId: normalized.customerId,
+      customerName: normalized.customerName || '',
+      customerPhone: normalized.customerPhone || '',
+      paymentDate: normalized.date,
+      payments: updatedOldPayments,
+    });
     newAmountPaid = roundCurrency(newAmountPaid + adjustment);
     newBalance = roundCurrency(newBalance - adjustment);
     newPayments.push({ amount: adjustment, appliedAmount: adjustment, date: normalized.date, paymentId: `credit-${creditInvoice.id}-${normalized.id}`, contactName: normalized.customerName || '', contactPhone: normalized.customerPhone || '' });
@@ -152,6 +161,40 @@ function recordLoginFailure(key) {
 }
 function clearLoginFailures(key) { loginAttempts.delete(key); }
 function paymentJsonSql(column = 'payments') { return `CASE WHEN jsonb_typeof(${column}) = 'array' THEN ${column} ELSE '[]'::jsonb END`; }
+async function syncInvoicePayments(client, invoice) {
+  const invoiceType = invoice.invoiceType === 'vendor' ? 'vendor' : 'customer';
+  await client.query('DELETE FROM payment_entries WHERE invoice_id=$1 AND invoice_type=$2', [invoice.id, invoiceType]);
+  const payments = Array.isArray(invoice.payments) ? invoice.payments : [];
+  const rows = payments.map((payment, index) => {
+    const amount = Number(payment.amount || 0);
+    if (amount <= 0) return null;
+    const paymentId = String(payment.paymentId || '');
+    return {
+      entryKey: `${invoiceType}:${invoice.id}:${paymentId || 'legacy'}:${index}`,
+      invoiceId: invoice.id,
+      invoiceType,
+      contactId: invoice.customerId || '',
+      contactName: payment.contactName || invoice.customerName || '',
+      contactPhone: payment.contactPhone || invoice.customerPhone || '',
+      paymentId,
+      amount,
+      appliedAmount: Number(payment.appliedAmount ?? payment.amount ?? 0),
+      paymentDate: payment.date || invoice.paymentDate || '',
+      entryIndex: index,
+    };
+  }).filter(Boolean);
+  if (!rows.length) return;
+  const values = [];
+  const placeholders = rows.map((row, rowIndex) => {
+    const offset = rowIndex * 11;
+    values.push(row.entryKey, row.invoiceId, row.invoiceType, row.contactId, row.contactName, row.contactPhone, row.paymentId, row.amount, row.appliedAmount, row.paymentDate, row.entryIndex);
+    return `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9},$${offset + 10},$${offset + 11})`;
+  });
+  await client.query(
+    `INSERT INTO payment_entries(entry_key,invoice_id,invoice_type,contact_id,contact_name,contact_phone,payment_id,amount,applied_amount,payment_date,entry_index) VALUES ${placeholders.join(',')}`,
+    values
+  );
+}
 async function applyPayment(contactId, amount, paymentDate, paymentId) {
   const client = await pool.connect();
   try {
@@ -202,6 +245,15 @@ async function applyPayment(contactId, amount, paymentDate, paymentId) {
         `UPDATE ${table} SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`,
         [amountPaid, paymentDate, balance, balance <= 0 ? 'Paid' : 'Due', JSON.stringify(payments), invoice.id]
       );
+      await syncInvoicePayments(client, {
+        id: invoice.id,
+        invoiceType: contact.type,
+        customerId: contact.id,
+        customerName: contact.full_name || invoice.customer_name || '',
+        customerPhone: contact.phone || invoice.customer_phone || '',
+        paymentDate,
+        payments,
+      });
       firstAllocation = false;
     }
     await client.query(
@@ -223,9 +275,11 @@ async function dashboardSummary(user, today, mode = 'customer') {
   const args = scoped ? [user.contact_id, today] : [today];
   const where = scoped ? 'WHERE customer_id=$1' : '';
   const todayParam = scoped ? '$2' : '$1';
+  const paymentScope = scoped ? 'AND pe.contact_id=$1' : '';
+  const invoiceType = mode === 'vendor' ? 'vendor' : 'customer';
   const { rows } = await query(`
     WITH combined AS (
-      SELECT total_amount,amount_paid,balance,status,payments,payment_date,date FROM ${mode === 'vendor' ? 'vendor_invoices' : 'invoices'} ${where}
+      SELECT total_amount,amount_paid,balance,status,date FROM ${mode === 'vendor' ? 'vendor_invoices' : 'invoices'} ${where}
     )
     SELECT COUNT(*)::int AS total_invoices,
       COALESCE(SUM(total_amount),0) AS total_revenue,
@@ -238,8 +292,8 @@ async function dashboardSummary(user, today, mode = 'customer') {
       COALESCE(SUM(GREATEST(balance,0)) FILTER (WHERE status='Overdue'),0) AS overdue_amount,
       COALESCE(SUM(GREATEST(balance,0)) FILTER (WHERE status IN ('Pending','Due')),0) AS due_amount,
       COALESCE(AVG(total_amount),0) AS average_invoice,
-      COALESCE(SUM((SELECT SUM(COALESCE(NULLIF(p->>'appliedAmount','')::numeric,NULLIF(p->>'amount','')::numeric,0)) FROM jsonb_array_elements(${paymentJsonSql()}) p WHERE p->>'date'=${todayParam})),0) AS today_collection,
-      COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(${paymentJsonSql()}) p WHERE p->>'date'=${todayParam}))::int AS today_paid_count,
+      (SELECT COALESCE(SUM(pe.applied_amount),0) FROM payment_entries pe WHERE pe.invoice_type='${invoiceType}' AND pe.payment_date=${todayParam} AND pe.applied_amount>0 ${paymentScope}) AS today_collection,
+      (SELECT COUNT(DISTINCT pe.invoice_id)::int FROM payment_entries pe WHERE pe.invoice_type='${invoiceType}' AND pe.payment_date=${todayParam} AND pe.applied_amount>0 ${paymentScope}) AS today_paid_count,
       COUNT(*) FILTER (WHERE status='Pending' AND date=${todayParam})::int AS today_pending_count
     FROM combined`, args);
   const r = rows[0] || {};
@@ -486,10 +540,9 @@ export default async function apiHandler(req, res) {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const date = new URL(req.url, 'http://localhost').searchParams.get('date')?.trim();
       if (!date) return json(res, 400, { error: 'date is required' });
-      const paymentDateCondition = `EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(payments)='array' THEN payments ELSE '[]'::jsonb END) payment WHERE payment->>'date'=$1 AND COALESCE(NULLIF(payment->>'appliedAmount','')::numeric,NULLIF(payment->>'amount','')::numeric,0)>0)`;
       const [customerResult, vendorResult] = await Promise.all([
-        query(`SELECT ${invoiceColumns}, created_at FROM invoices WHERE ${paymentDateCondition}`, [date]),
-        query(`SELECT ${invoiceColumns}, created_at FROM vendor_invoices WHERE ${paymentDateCondition}`, [date]),
+        query(`SELECT ${invoiceColumns}, created_at FROM invoices WHERE id IN (SELECT DISTINCT invoice_id FROM payment_entries WHERE invoice_type='customer' AND payment_date=$1 AND applied_amount>0)`, [date]),
+        query(`SELECT ${invoiceColumns}, created_at FROM vendor_invoices WHERE id IN (SELECT DISTINCT invoice_id FROM payment_entries WHERE invoice_type='vendor' AND payment_date=$1 AND applied_amount>0)`, [date]),
       ]);
       const rows = [
         ...customerResult.rows.map((row) => invoiceView(row, 'customer')),
@@ -591,6 +644,7 @@ export default async function apiHandler(req, res) {
             [adjusted.amountPaid, normalized.date, adjusted.balance, adjusted.balance <= 0 ? 'Paid' : normalized.status, JSON.stringify(adjusted.payments), normalized.id]
           );
         }
+        await syncInvoicePayments(client, { ...normalized, amountPaid: adjusted.amountPaid, balance: adjusted.balance, payments: adjusted.payments });
         await client.query('COMMIT');
         return json(res, 201, { success: true, creditApplied: adjusted.applied });
       } catch (error) {
@@ -615,6 +669,7 @@ export default async function apiHandler(req, res) {
         if (adjusted.applied > 0) {
           await client.query(`UPDATE ${table} SET amount_paid=$1,payment_date=$2,balance=$3,status=$4,payments=$5 WHERE id=$6`, [adjusted.amountPaid, normalized.date, adjusted.balance, adjusted.balance <= 0 ? 'Paid' : normalized.status, JSON.stringify(adjusted.payments), normalized.id]);
         }
+        await syncInvoicePayments(client, { ...normalized, amountPaid: adjusted.amountPaid, balance: adjusted.balance, payments: adjusted.payments });
         await client.query('COMMIT');
         return json(res, 200, { success: true, creditApplied: adjusted.applied });
       } catch (error) {
