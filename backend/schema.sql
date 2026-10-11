@@ -112,6 +112,49 @@ CREATE TABLE IF NOT EXISTS payment_logs (
 CREATE INDEX IF NOT EXISTS payment_logs_created_at_idx ON payment_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS payment_logs_contact_id_idx ON payment_logs(contact_id);
 
+CREATE TABLE IF NOT EXISTS payment_entries (
+  entry_key TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL,
+  invoice_type TEXT NOT NULL CHECK (invoice_type IN ('customer', 'vendor')),
+  contact_id TEXT NOT NULL DEFAULT '',
+  contact_name TEXT NOT NULL DEFAULT '',
+  contact_phone TEXT NOT NULL DEFAULT '',
+  payment_id TEXT NOT NULL DEFAULT '',
+  amount NUMERIC NOT NULL DEFAULT 0,
+  applied_amount NUMERIC NOT NULL DEFAULT 0,
+  payment_date TEXT NOT NULL DEFAULT '',
+  entry_index INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS payment_entries_invoice_idx ON payment_entries(invoice_id, invoice_type);
+CREATE INDEX IF NOT EXISTS payment_entries_date_idx ON payment_entries(payment_date);
+CREATE INDEX IF NOT EXISTS payment_entries_type_date_idx ON payment_entries(invoice_type, payment_date, applied_amount);
+CREATE INDEX IF NOT EXISTS payment_entries_contact_date_idx ON payment_entries(contact_id, payment_date);
+
+INSERT INTO payment_entries(entry_key, invoice_id, invoice_type, contact_id, contact_name, contact_phone, payment_id, amount, applied_amount, payment_date, entry_index)
+SELECT
+  source.invoice_type || ':' || source.id || ':' || COALESCE(NULLIF(payment.value->>'paymentId', ''), 'legacy') || ':' || (payment.ordinality - 1),
+  source.id,
+  source.invoice_type,
+  source.customer_id,
+  source.customer_name,
+  source.customer_phone,
+  COALESCE(payment.value->>'paymentId', ''),
+  COALESCE(NULLIF(payment.value->>'amount', '')::numeric, 0),
+  COALESCE(NULLIF(payment.value->>'appliedAmount', '')::numeric, NULLIF(payment.value->>'amount', '')::numeric, 0),
+  COALESCE(payment.value->>'date', ''),
+  payment.ordinality - 1
+FROM (
+  SELECT id, customer_id, customer_name, customer_phone, payments, 'customer' AS invoice_type FROM invoices
+  UNION ALL
+  SELECT id, customer_id, customer_name, customer_phone, payments, 'vendor' AS invoice_type FROM vendor_invoices
+) source
+CROSS JOIN LATERAL jsonb_array_elements(
+  CASE WHEN jsonb_typeof(source.payments) = 'array' THEN source.payments ELSE '[]'::jsonb END
+) WITH ORDINALITY payment
+WHERE COALESCE(NULLIF(payment.value->>'amount', '')::numeric, 0) > 0
+ON CONFLICT(entry_key) DO NOTHING;
+
 INSERT INTO payment_logs(payment_id, contact_id, contact_name, contact_phone, amount, payment_date)
 SELECT
   COALESCE(NULLIF(payment->>'paymentId', ''), source.id || '-' || COALESCE(NULLIF(payment->>'date', ''), 'payment')),
