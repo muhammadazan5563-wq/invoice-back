@@ -180,3 +180,27 @@ CREATE INDEX IF NOT EXISTS vendor_invoices_created_at_idx ON vendor_invoices(cre
 CREATE INDEX IF NOT EXISTS invoices_customer_id_idx ON invoices(customer_id);
 CREATE INDEX IF NOT EXISTS vendor_invoices_customer_id_idx ON vendor_invoices(customer_id);
 CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at);
+
+
+-- Ledger columns used by the API (kept idempotent for existing Railway databases).
+ALTER TABLE ledger_invoices ADD COLUMN IF NOT EXISTS ledger_date TEXT;
+ALTER TABLE ledger_invoices ADD COLUMN IF NOT EXISTS invoices JSONB NOT NULL DEFAULT '[]'::jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS ledger_invoices_ledger_date_key ON ledger_invoices(ledger_date);
+CREATE INDEX IF NOT EXISTS ledger_invoices_ledger_date_idx ON ledger_invoices(ledger_date DESC);
+
+-- Safe, transactionally allocated invoice numbers.
+CREATE TABLE IF NOT EXISTS invoice_counters (
+  prefix TEXT PRIMARY KEY,
+  next_number BIGINT NOT NULL CHECK (next_number > 0)
+);
+
+-- Invoice list and filter indexes.
+CREATE INDEX IF NOT EXISTS invoices_customer_id_created_idx ON invoices(customer_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS vendor_invoices_customer_id_created_idx ON vendor_invoices(customer_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS invoices_date_idx ON invoices(date);
+CREATE INDEX IF NOT EXISTS vendor_invoices_date_idx ON vendor_invoices(date);
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS invoices_name_trgm_idx ON invoices USING gin (customer_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS invoices_email_trgm_idx ON invoices USING gin (customer_email gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS vendor_invoices_name_trgm_idx ON vendor_invoices USING gin (customer_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS vendor_invoices_email_trgm_idx ON vendor_invoices USING gin (customer_email gin_trgm_ops);
