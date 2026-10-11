@@ -410,6 +410,57 @@ export default async function apiHandler(req, res) {
       const row = rows[0] || {};
       return json(res, 200, { billed: Number(row.total_billed || 0), paid: Number(row.total_paid || 0), overpaid: Number(row.total_overpaid || 0), outstanding: Number(row.outstanding || 0), settled: Number(row.settled || 0), overdue: Number(row.overdue || 0), invoiceCount: Number(row.invoice_count || 0) });
     }
+    if (path === '/api/accounts' && method === 'GET') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const accountType = new URL(req.url, 'http://localhost').searchParams.get('type') === 'vendor' ? 'vendor' : 'customer';
+      const table = accountType === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const { rows } = await query(`
+        WITH invoice_totals AS (
+          SELECT customer_id,
+            COALESCE(SUM(GREATEST(balance, 0)), 0) AS outstanding,
+            COALESCE(SUM(GREATEST(-balance, 0)), 0) AS overpaid,
+            COALESCE(SUM(total_amount), 0) AS total_billed,
+            COALESCE(SUM(GREATEST(amount_paid, 0)), 0) AS total_paid,
+            COUNT(*)::int AS invoice_count
+          FROM ${table}
+          GROUP BY customer_id
+        ), ranked_invoices AS (
+          SELECT customer_id, id, date, total_amount,
+            ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY date DESC, created_at DESC, id DESC) AS row_number
+          FROM ${table}
+        )
+        SELECT c.id, c.type, c.full_name, c.email, c.phone, c.company_name,
+          COALESCE(it.outstanding, 0) AS outstanding,
+          COALESCE(it.overpaid, 0) AS overpaid,
+          COALESCE(it.total_billed, 0) AS total_billed,
+          COALESCE(it.total_paid, 0) AS total_paid,
+          COALESCE(it.invoice_count, 0) AS invoice_count,
+          COALESCE(ri.id, '') AS last_invoice,
+          COALESCE(ri.date, '') AS last_invoice_date,
+          COALESCE(ri.total_amount, 0) AS last_invoice_total
+        FROM contacts c
+        LEFT JOIN invoice_totals it ON it.customer_id = c.id::text
+        LEFT JOIN ranked_invoices ri ON ri.customer_id = c.id::text AND ri.row_number = 1
+        WHERE c.type = $1 AND COALESCE(it.outstanding, 0) > 0
+        ORDER BY COALESCE(it.outstanding, 0) DESC, LOWER(c.full_name) ASC, c.id ASC
+      `, [accountType]);
+      return json(res, 200, rows.map((row) => ({
+        id: row.id,
+        type: row.type,
+        name: row.full_name || '',
+        email: row.email || '',
+        phone: row.phone || '',
+        companyName: row.company_name || '',
+        outstanding: Number(row.outstanding || 0),
+        overpaid: Number(row.overpaid || 0),
+        totalBilled: Number(row.total_billed || 0),
+        totalPaid: Number(row.total_paid || 0),
+        invoiceCount: Number(row.invoice_count || 0),
+        lastInvoice: row.last_invoice || '',
+        lastInvoiceDate: row.last_invoice_date || '',
+        lastInvoiceTotal: Number(row.last_invoice_total || 0),
+      })));
+    }
     if (path === '/api/invoices/expenses' && method === 'GET') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       const url = new URL(req.url, 'http://localhost');
