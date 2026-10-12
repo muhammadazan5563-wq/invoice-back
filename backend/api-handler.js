@@ -52,7 +52,7 @@ function invoiceView(row, type) {
   const paymentHistoryTotal = payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
   const amountPaid = roundCurrency(Math.max(Number(row.amount_paid || 0), paymentHistoryTotal));
   const balance = roundCurrency(totalAmount - amountPaid);
-  return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount, taxRate: Number(row.tax_rate || 0), taxAmount: roundCurrency(row.tax_amount), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: roundCurrency(row.expense_total), amountPaid, paymentDate: row.payment_date || '', balance, status: balance <= 0 ? 'Paid' : row.status || 'Pending', notes: row.notes || '', items: row.items || [], payments, rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
+  return { rowIndex: 0, id: row.id, date: row.date, customerName: row.customer_name || '', customerId: row.customer_id || '', customerEmail: row.customer_email || '', customerPhone: row.customer_phone || '', totalAmount, taxRate: Number(row.tax_rate || 0), taxAmount: roundCurrency(row.tax_amount), expenses: { baraf: Number(row.baraf || 0), rickshawRent: Number(row.rickshaw_rent || 0), workerExpense: Number(row.worker_expense || 0) }, expenseTotal: roundCurrency(row.expense_total), amountPaid, paymentDate: row.payment_date || '', balance, status: row.status || (balance <= 0 ? 'Paid' : 'Pending'), notes: row.notes || '', items: row.items || [], payments, rawRow: [], invoiceType: type || row.invoice_type || 'customer' };
 }
 const invoiceColumns = 'id,date,customer_name,customer_email,customer_phone,customer_id,total_amount,tax_rate,tax_amount,baraf,rickshaw_rent,worker_expense,expense_total,amount_paid,payment_date,balance,status,notes,items,payments,invoice_type';
 const invoiceListColumns = 'id,date,customer_name,customer_email,customer_phone,customer_id,total_amount,tax_rate,tax_amount,baraf,rickshaw_rent,worker_expense,expense_total,amount_paid,payment_date,balance,status,invoice_type';
@@ -99,7 +99,7 @@ function consumeUnappliedCredit(payments, amount) {
   }
   return nextPayments.filter((payment) => Number(payment.amount || 0) > 0);
 }
-function contactView(c, includeDocuments = false) {
+function contactView(c, includeDocuments = false, includePassword = false) {
   return {
     id: c.id, type: c.type, fullName: c.full_name || '', phone: c.phone || '', email: c.email || '',
     companyName: c.company_name || '', location: c.location || '', address: c.address || '', area: c.area || '',
@@ -108,8 +108,8 @@ function contactView(c, includeDocuments = false) {
       cnicFrontUrl: c.cnic_front_data || c.cnic_front_url || '',
       cnicBackUrl: c.cnic_back_data || c.cnic_back_url || '',
       chequeUrl: c.cheque_data || c.cheque_url || '',
-      tempPassword: c.temp_password || '',
     } : {}),
+    ...(includePassword ? { tempPassword: c.temp_password || '' } : {}),
     createdAt: c.created_at,
   };
 }
@@ -573,8 +573,8 @@ export default async function apiHandler(req, res) {
     }
     if (path === '/api/contacts' && method === 'GET') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
-      const { rows } = await query('SELECT id,type,full_name,phone,email,company_name,location,address,area,tax_rate,created_at FROM contacts ORDER BY created_at DESC');
-      return json(res, 200, rows.map((row) => contactView(row)));
+      const { rows } = await query('SELECT id,type,full_name,phone,email,company_name,location,address,area,tax_rate,temp_password,created_at FROM contacts ORDER BY created_at DESC');
+      return json(res, 200, rows.map((row) => contactView(row, false, true)));
     }
     if (path === '/api/contacts' && method === 'POST') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' }); const d = req.body || {}; const email = emailOf(d.email); const password = String(d.password || randomBytes(9).toString('base64url'));
@@ -655,7 +655,14 @@ export default async function apiHandler(req, res) {
     if (invoiceDetailMatch && method === 'GET') {
       if (!user) return json(res, 401, { error: 'Authentication required' });
       const id = decodeURIComponent(invoiceDetailMatch[1]); const invoiceType = new URL(req.url, 'http://localhost').searchParams.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
-      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices'; const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE id=$1 LIMIT 1`, [id]);
+      if (!adminOnly(user)) {
+        const expectedType = user.role === 'vendor' ? 'vendor' : 'customer';
+        if (user.contact_id == null || expectedType !== invoiceType) return json(res, 403, { error: 'You may only access your own invoice details' });
+      }
+      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const detailArgs = adminOnly(user) ? [id] : [id, user.contact_id];
+      const scope = adminOnly(user) ? 'id=$1' : 'id=$1 AND customer_id=$2';
+      const { rows } = await query(`SELECT ${invoiceColumns}, created_at FROM ${table} WHERE ${scope} LIMIT 1`, detailArgs);
       return rows[0] ? json(res, 200, invoiceView(rows[0], invoiceType)) : json(res, 404, { error: 'Invoice not found' });
     }
     if (path === '/api/invoices' && method === 'POST') {
