@@ -712,7 +712,25 @@ export default async function apiHandler(req, res) {
         client.release();
       }
     }
-    if (invoiceMatch && method === 'DELETE') { if (!adminOnly(user)) return json(res,403,{error:'Administrator access required'}); const table=new URL(req.url,'http://localhost').searchParams.get('invoiceType')==='vendor'?'vendor_invoices':'invoices'; await query(`DELETE FROM ${table} WHERE id=$1`,[decodeURIComponent(invoiceMatch[1])]); return json(res,200,{success:true}); }
+    if (invoiceMatch && method === 'DELETE') {
+      if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
+      const invoiceId = decodeURIComponent(invoiceMatch[1]);
+      const invoiceType = new URL(req.url, 'http://localhost').searchParams.get('invoiceType') === 'vendor' ? 'vendor' : 'customer';
+      const table = invoiceType === 'vendor' ? 'vendor_invoices' : 'invoices';
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM payment_entries WHERE invoice_id=$1 AND invoice_type=$2', [invoiceId, invoiceType]);
+        const result = await client.query(`DELETE FROM ${table} WHERE id=$1`, [invoiceId]);
+        await client.query('COMMIT');
+        return json(res, 200, { success: true, deleted: result.rowCount > 0 });
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
 
     if (path.startsWith('/api/settings/') && method === 'GET') {
       if (!user) return json(res,401,{error:'Authentication required'}); const uid=decodeURIComponent(path.split('/').pop()); const {rows}=await query('SELECT * FROM user_settings WHERE user_id=$1 OR user_id=$2 LIMIT 1',[uid,uid]); return json(res,200,rows[0]||null); }
