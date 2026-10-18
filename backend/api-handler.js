@@ -4,6 +4,7 @@ import { pool, query } from './db.js';
 
 const scrypt = promisify(scryptCallback);
 const SESSION_DAYS = 30;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000);
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
 const loginAttempts = new Map();
@@ -45,6 +46,18 @@ function sessionView(user, token) {
     taxRate: Number(user.tax_rate || 0), cnicFrontUrl: user.cnic_front_url || '', cnicBackUrl: user.cnic_back_url || '',
     chequeUrl: user.cheque_url || '', tempPassword: user.temp_password || '', createdAt: user.contact_created_at,
   } : null, accessToken: null };
+}
+async function askOpenAI(messages) {
+  const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
+  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured on the backend.');
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature: 0.2, max_tokens: 700 }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error?.message || `OpenAI request failed (${response.status})`);
+  return String(payload?.choices?.[0]?.message?.content || '').trim();
 }
 function invoiceView(row, type) {
   const totalAmount = roundCurrency(row.total_amount);
@@ -378,6 +391,21 @@ export default async function apiHandler(req, res) {
     }
 
     const user = await currentUser(req);
+    if (path === '/api/chat' && method === 'POST') {
+      if (!user) return json(res, 401, { error: 'Not authenticated' });
+      const message = String(req.body?.message || '').trim();
+      if (!message) return json(res, 400, { error: 'A message is required' });
+      const history = Array.isArray(req.body?.history) ? req.body.history.slice(-10).map((item) => ({
+        role: item?.role === 'user' ? 'user' : 'assistant',
+        content: String(item?.content || '').slice(0, 4000),
+      })).filter((item) => item.content) : [];
+      const reply = await askOpenAI([
+        { role: 'system', content: `You are Naidify AI, a concise and professional business assistant inside a fish-trading invoice ledger. The signed-in user has role ${user.role}. Help with invoices, payments, balances, contacts, expenses and reports. Do not claim that you completed a database action; explain that actions will require confirmation and approved backend tools. If a live figure is not available in the provided context, say so clearly rather than inventing it. Keep replies under 120 words.` },
+        ...history,
+        { role: 'user', content: message },
+      ]);
+      return json(res, 200, { message: reply || 'I could not prepare a response. Please try again.' });
+    }
     if (path === '/api/invoices/next-id' && method === 'GET') {
       if (!adminOnly(user)) return json(res, 403, { error: 'Administrator access required' });
       return json(res, 200, { id: await nextInvoiceId() });
