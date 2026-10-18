@@ -10,6 +10,7 @@ const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flas
 const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000);
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
 const loginAttempts = new Map();
+const pendingChatActions = new Map();
 const json = (res, status, value) => res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate').status(status).json(value);
 const emailOf = (value) => String(value || '').trim().toLowerCase();
 const hashToken = (value) => createHash('sha256').update(value).digest('hex');
@@ -89,6 +90,61 @@ async function askAssistant(messages) {
   if (AI_PROVIDER === 'openrouter') return askOpenRouter(messages);
   if (AI_PROVIDER === 'gemini') return askGemini(messages);
   throw new Error(`Unsupported AI_PROVIDER: ${AI_PROVIDER}. Use gemini or openrouter.`);
+}
+function pakistanToday() {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+async function liveChatContext(user, message) {
+  const normalized = String(message || '').toLowerCase();
+  if (!/invoice/.test(normalized) || !/(today|todays|today's|آج|آج)/.test(normalized)) return '';
+  const today = pakistanToday();
+  const results = [];
+  const targets = user.role === 'admin'
+    ? [{ table: 'invoices', type: 'customer', scoped: false }, { table: 'vendor_invoices', type: 'vendor', scoped: false }]
+    : [{ table: user.role === 'vendor' ? 'vendor_invoices' : 'invoices', type: user.role === 'vendor' ? 'vendor' : 'customer', scoped: true }];
+  for (const target of targets) {
+    const params = target.scoped ? [user.contact_id, today] : [today];
+    const where = target.scoped ? 'customer_id=$1 AND date=$2' : 'date=$1';
+    const { rows } = await query(`SELECT id,date,customer_name,total_amount,amount_paid,balance,status FROM ${target.table} WHERE ${where} ORDER BY id ASC`, params);
+    results.push(...rows.map((row) => ({ type: target.type, id: row.id, date: row.date, name: row.customer_name, total: Number(row.total_amount || 0), paid: Number(row.amount_paid || 0), balance: Number(row.balance || 0), status: row.status || '' })));
+  }
+  return JSON.stringify({ date: today, invoiceCount: results.length, invoices: results });
+}
+async function prepareChatWrite(user, message) {
+  if (user.role !== 'admin') return null;
+  const normalized = String(message || '').trim();
+  const amountMatch = normalized.match(/(?:₨|rs\.?|pkr\.?|amount\s*)?\s*([\d,]+(?:\.\d+)?)/i);
+  const amount = amountMatch ? Number(amountMatch[1].replace(/,/g, '')) : 0;
+  if (!amount || amount <= 0) return null;
+  const paymentIntent = /\b(record|add|received|receive|collect|payment|paid)\b/i.test(normalized) && /\b(payment|received|receive|collect|paid|from)\b/i.test(normalized);
+  if (paymentIntent) {
+    const fromMatch = normalized.match(/\bfrom\s+(.+?)(?:\s+(?:today|on|for)\b|$)/i);
+    const contactName = String(fromMatch?.[1] || '').trim().replace(/[.,!?]+$/, '');
+    if (!contactName) return { missing: 'Please tell me who the payment is from. Example: “Record a payment of ₨50,000 from Ahmed Traders.”' };
+    const { rows } = await query('SELECT id,full_name,company_name,type FROM contacts WHERE full_name ILIKE $1 OR company_name ILIKE $1 ORDER BY full_name LIMIT 5', [`%${contactName}%`]);
+    if (rows.length !== 1) return { missing: rows.length ? `I found more than one contact matching “${contactName}”. Please use the full customer or vendor name.` : `I couldn’t find a contact matching “${contactName}”. Please check the name and try again.` };
+    const contact = rows[0];
+    return { type: 'record_payment', amount, contactId: contact.id, contactName: contact.company_name || contact.full_name, contactType: contact.type, summary: `Record a ₨${amount.toLocaleString()} payment from ${contact.company_name || contact.full_name} and apply it to their oldest unpaid invoices.` };
+  }
+  if (/\b(add|record|log)\b.*\b(expense|cost)\b/i.test(normalized)) {
+    const description = normalized.replace(/.*?\b(?:expense|cost)\b/i, '').replace(/^[\s:=-]+/, '').replace(/[.,!?]+$/, '').trim() || 'Business expense';
+    return { type: 'add_expense', amount, description, summary: `Add a ₨${amount.toLocaleString()} expense named “${description}”.` };
+  }
+  return null;
+}
+async function executeChatWrite(action) {
+  if (action.type === 'record_payment') {
+    const paymentId = `chat-${Date.now()}`;
+    const result = await applyPayment(action.contactId, action.amount, pakistanToday(), paymentId);
+    return `Payment recorded successfully. ₨${Number(result.allocated || action.amount).toLocaleString()} was applied to ${action.contactName}’s oldest unpaid invoices.`;
+  }
+  if (action.type === 'add_expense') {
+    await query('INSERT INTO cash_expenses(name,amount,description,tag) VALUES($1,$2,$3,$4)', [action.description, action.amount, action.description, 'expense']);
+    return `Expense added successfully: ₨${Number(action.amount).toLocaleString()} for ${action.description}.`;
+  }
+  throw new Error('Unsupported chatbot action.');
 }
 function invoiceView(row, type) {
   const totalAmount = roundCurrency(row.total_amount);
@@ -426,12 +482,33 @@ export default async function apiHandler(req, res) {
       if (!user) return json(res, 401, { error: 'Not authenticated' });
       const message = String(req.body?.message || '').trim();
       if (!message) return json(res, 400, { error: 'A message is required' });
+      const pendingAction = pendingChatActions.get(user.id);
+      if (/^(cancel|no|nevermind|never mind)\b/i.test(message)) {
+        pendingChatActions.delete(user.id);
+        return json(res, 200, { message: pendingAction ? 'Cancelled. No changes were made.' : 'There is no pending action to cancel.' });
+      }
+      if (/^(confirm|yes|approve|do it|proceed)\b/i.test(message)) {
+        if (!pendingAction || pendingAction.expiresAt < Date.now()) {
+          pendingChatActions.delete(user.id);
+          return json(res, 200, { message: 'That approval has expired. Please repeat the request.' });
+        }
+        pendingChatActions.delete(user.id);
+        return json(res, 200, { message: await executeChatWrite(pendingAction) });
+      }
+      const writeAction = await prepareChatWrite(user, message);
+      if (writeAction?.missing) return json(res, 200, { message: writeAction.missing });
+      if (writeAction) {
+        pendingChatActions.set(user.id, { ...writeAction, expiresAt: Date.now() + 5 * 60 * 1000 });
+        return json(res, 200, { message: `${writeAction.summary}\n\nWould you like me to proceed? Reply “Confirm” to approve or “Cancel” to make no changes.`, approvalRequired: true });
+      }
       const history = Array.isArray(req.body?.history) ? req.body.history.slice(-10).map((item) => ({
         role: item?.role === 'user' ? 'user' : 'assistant',
         content: String(item?.content || '').slice(0, 4000),
       })).filter((item) => item.content) : [];
+      const liveContext = await liveChatContext(user, message);
       const reply = await askAssistant([
-        { role: 'system', content: `You are Naidify AI, a concise and professional business assistant inside a fish-trading invoice ledger. The signed-in user has role ${user.role}. Help with invoices, payments, balances, contacts, expenses and reports. Do not claim that you completed a database action; explain that actions will require confirmation and approved backend tools. If a live figure is not available in the provided context, say so clearly rather than inventing it. Keep replies under 120 words.` },
+        { role: 'system', content: `You are Naidify AI, a concise and professional business assistant inside a fish-trading invoice ledger. The signed-in user has role ${user.role}. Help with invoices, payments, balances, contacts, expenses and reports. Use the supplied live ledger context when answering and never say you lack access when relevant context is present. Do not claim that you completed a database action; explain that actions will require confirmation and approved backend tools. If a live figure is not available in the provided context, say so clearly rather than inventing it. Keep replies under 120 words.` },
+        ...(liveContext ? [{ role: 'system', content: `LIVE LEDGER CONTEXT (trusted backend result; answer from this data): ${liveContext}` }] : []),
         ...history,
         { role: 'user', content: message },
       ]);
