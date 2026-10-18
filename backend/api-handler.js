@@ -4,7 +4,9 @@ import { pool, query } from './db.js';
 
 const scrypt = promisify(scryptCallback);
 const SESSION_DAYS = 30;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const AI_PROVIDER = String(process.env.AI_PROVIDER || 'gemini').trim().toLowerCase();
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-001';
 const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000);
 const LOGIN_MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 5);
 const loginAttempts = new Map();
@@ -47,17 +49,46 @@ function sessionView(user, token) {
     chequeUrl: user.cheque_url || '', tempPassword: user.temp_password || '', createdAt: user.contact_created_at,
   } : null, accessToken: null };
 }
-async function askOpenAI(messages) {
-  const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
-  if (!apiKey) throw new Error('OPENAI_API_KEY is not configured on the backend.');
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+async function askGemini(messages) {
+  const apiKey = String(process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured on the backend.');
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature: 0.2, max_tokens: 700 }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: messages.find((item) => item.role === 'system')?.content || '' }] },
+      contents: messages.filter((item) => item.role !== 'system').map((item) => ({
+        role: item.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: item.content }],
+      })),
+      generationConfig: { temperature: 0.2, maxOutputTokens: 700 },
+    }),
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.error?.message || `OpenAI request failed (${response.status})`);
+  if (!response.ok) throw new Error(payload?.error?.message || `Gemini request failed (${response.status})`);
+  return String(payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '').trim();
+}
+async function askOpenRouter(messages) {
+  const apiKey = String(process.env.OPENROUTER_API_KEY || '').trim();
+  if (!apiKey) throw new Error('OPENROUTER_API_KEY is not configured on the backend.');
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+      'HTTP-Referer': String(process.env.OPENROUTER_SITE_URL || 'http://localhost:3000'),
+      'X-Title': String(process.env.OPENROUTER_APP_NAME || 'Naidify AI'),
+    },
+    body: JSON.stringify({ model: OPENROUTER_MODEL, messages, temperature: 0.2, max_tokens: 700 }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error?.message || `OpenRouter request failed (${response.status})`);
   return String(payload?.choices?.[0]?.message?.content || '').trim();
+}
+async function askAssistant(messages) {
+  if (AI_PROVIDER === 'openrouter') return askOpenRouter(messages);
+  if (AI_PROVIDER === 'gemini') return askGemini(messages);
+  throw new Error(`Unsupported AI_PROVIDER: ${AI_PROVIDER}. Use gemini or openrouter.`);
 }
 function invoiceView(row, type) {
   const totalAmount = roundCurrency(row.total_amount);
@@ -399,7 +430,7 @@ export default async function apiHandler(req, res) {
         role: item?.role === 'user' ? 'user' : 'assistant',
         content: String(item?.content || '').slice(0, 4000),
       })).filter((item) => item.content) : [];
-      const reply = await askOpenAI([
+      const reply = await askAssistant([
         { role: 'system', content: `You are Naidify AI, a concise and professional business assistant inside a fish-trading invoice ledger. The signed-in user has role ${user.role}. Help with invoices, payments, balances, contacts, expenses and reports. Do not claim that you completed a database action; explain that actions will require confirmation and approved backend tools. If a live figure is not available in the provided context, say so clearly rather than inventing it. Keep replies under 120 words.` },
         ...history,
         { role: 'user', content: message },
