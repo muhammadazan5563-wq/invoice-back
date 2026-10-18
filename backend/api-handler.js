@@ -98,19 +98,24 @@ function pakistanToday() {
 }
 async function liveChatContext(user, message) {
   const normalized = String(message || '').toLowerCase();
-  if (!/invoice|sales|sale/.test(normalized) || !/(today|todays|today['’]s|آج|آج)/.test(normalized)) return '';
+  const isToday = /(today|todays|today['’]s|آج|آج)/.test(normalized);
+  const isRecent = /\b(recent|latest|newest|last)\b/.test(normalized);
+  const isOverdue = /\boverdue\b/.test(normalized);
+  if (!/invoice|sales|sale/.test(normalized) || (!isToday && !isRecent && !isOverdue)) return '';
   const today = pakistanToday();
   const results = [];
   const targets = user.role === 'admin'
     ? [{ table: 'invoices', type: 'customer', scoped: false }, { table: 'vendor_invoices', type: 'vendor', scoped: false }]
     : [{ table: user.role === 'vendor' ? 'vendor_invoices' : 'invoices', type: user.role === 'vendor' ? 'vendor' : 'customer', scoped: true }];
   for (const target of targets) {
-    const params = target.scoped ? [user.contact_id, today] : [today];
-    const where = target.scoped ? 'customer_id=$1 AND date=$2' : 'date=$1';
-    const { rows } = await query(`SELECT id,date,customer_name,total_amount,amount_paid,balance,status FROM ${target.table} WHERE ${where} ORDER BY id ASC`, params);
+    const params = target.scoped ? [user.contact_id] : [];
+    const conditions = target.scoped ? ['customer_id=$1'] : [];
+    if (isToday) { params.push(today); conditions.push(`date=$${params.length}`); }
+    if (isOverdue) conditions.push(`balance>0 AND (status='Overdue' OR date < '${today}')`);
+    const { rows } = await query(`SELECT id,date,customer_name,total_amount,amount_paid,balance,status FROM ${target.table} WHERE ${conditions.length ? conditions.join(' AND ') : 'TRUE'} ORDER BY date DESC,id DESC LIMIT ${isRecent ? 10 : 100}`, params);
     results.push(...rows.map((row) => ({ type: target.type, id: row.id, date: row.date, name: row.customer_name, total: Number(row.total_amount || 0), paid: Number(row.amount_paid || 0), balance: Number(row.balance || 0), status: row.status || '' })));
   }
-  return JSON.stringify({ date: today, invoiceCount: results.length, invoices: results });
+  return JSON.stringify({ date: today, reportType: isToday ? 'today' : isOverdue ? 'overdue' : 'recent', invoiceCount: results.length, invoices: results });
 }
 async function prepareChatWrite(user, message) {
   if (user.role !== 'admin') return null;
@@ -506,16 +511,18 @@ export default async function apiHandler(req, res) {
         content: String(item?.content || '').slice(0, 4000),
       })).filter((item) => item.content) : [];
       const liveContext = await liveChatContext(user, message);
-      if (liveContext && /invoice|sales|sale/.test(message.toLowerCase()) && /(today|todays|today['’]s|آج|آج)/i.test(message)) {
+      if (liveContext && /invoice|sales|sale/.test(message.toLowerCase()) && /(today|todays|today['’]s|آج|آج|recent|latest|newest|last|overdue)/i.test(message)) {
         const report = JSON.parse(liveContext);
         const customerInvoices = report.invoices.filter((invoice) => invoice.type === 'customer');
         const vendorInvoices = report.invoices.filter((invoice) => invoice.type === 'vendor');
         const salesTotal = customerInvoices.reduce((sum, invoice) => sum + invoice.total, 0);
         const collectedTotal = customerInvoices.reduce((sum, invoice) => sum + invoice.paid, 0);
         const lines = report.invoices.length
-          ? report.invoices.map((invoice) => `• ${invoice.id} — ${invoice.name || 'Unnamed contact'} — ₨${invoice.total.toLocaleString()} (${invoice.status || 'Due'})`).join('\n')
-          : 'No invoices were created today.';
-        return json(res, 200, { message: `Today’s invoice report (${report.date})\n\nCustomer sales: ₨${salesTotal.toLocaleString()}\nCustomer collections: ₨${collectedTotal.toLocaleString()}\nCustomer invoices: ${customerInvoices.length}\nVendor invoices: ${vendorInvoices.length}\n\n${lines}` });
+          ? report.invoices.map((invoice) => `• ${invoice.id} — ${invoice.name || 'Unnamed contact'} — ${invoice.date} — ₨${invoice.total.toLocaleString()} (${invoice.status || 'Due'})`).join('\n')
+          : report.reportType === 'overdue' ? 'No overdue invoices found.' : report.reportType === 'recent' ? 'No recent invoices found.' : 'No invoices were created today.';
+        const heading = report.reportType === 'recent' ? 'Recent invoices' : report.reportType === 'overdue' ? 'Overdue invoices' : `Today’s invoice report (${report.date})`;
+        const summary = report.reportType === 'today' ? `\n\nCustomer sales: ₨${salesTotal.toLocaleString()}\nCustomer collections: ₨${collectedTotal.toLocaleString()}\nCustomer invoices: ${customerInvoices.length}\nVendor invoices: ${vendorInvoices.length}` : `\n\nMatching invoices: ${report.invoiceCount}`;
+        return json(res, 200, { message: `${heading}${summary}\n\n${lines}` });
       }
       const reply = await askAssistant([
         { role: 'system', content: `You are Naidify AI, a concise and professional business assistant inside a fish-trading invoice ledger. The signed-in user has role ${user.role}. Help with invoices, payments, balances, contacts, expenses and reports. Use the supplied live ledger context when answering and never say you lack access when relevant context is present. Do not claim that you completed a database action; explain that actions will require confirmation and approved backend tools. If a live figure is not available in the provided context, say so clearly rather than inventing it. Keep replies under 120 words.` },
