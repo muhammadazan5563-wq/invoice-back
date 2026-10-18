@@ -98,7 +98,7 @@ function pakistanToday() {
 }
 async function liveChatContext(user, message) {
   const normalized = String(message || '').toLowerCase();
-  if (!/invoice/.test(normalized) || !/(today|todays|today's|آج|آج)/.test(normalized)) return '';
+  if (!/invoice|sales|sale/.test(normalized) || !/(today|todays|today['’]s|آج|آج)/.test(normalized)) return '';
   const today = pakistanToday();
   const results = [];
   const targets = user.role === 'admin'
@@ -506,6 +506,17 @@ export default async function apiHandler(req, res) {
         content: String(item?.content || '').slice(0, 4000),
       })).filter((item) => item.content) : [];
       const liveContext = await liveChatContext(user, message);
+      if (liveContext && /invoice|sales|sale/.test(message.toLowerCase()) && /(today|todays|today['’]s|آج|آج)/i.test(message)) {
+        const report = JSON.parse(liveContext);
+        const customerInvoices = report.invoices.filter((invoice) => invoice.type === 'customer');
+        const vendorInvoices = report.invoices.filter((invoice) => invoice.type === 'vendor');
+        const salesTotal = customerInvoices.reduce((sum, invoice) => sum + invoice.total, 0);
+        const collectedTotal = customerInvoices.reduce((sum, invoice) => sum + invoice.paid, 0);
+        const lines = report.invoices.length
+          ? report.invoices.map((invoice) => `• ${invoice.id} — ${invoice.name || 'Unnamed contact'} — ₨${invoice.total.toLocaleString()} (${invoice.status || 'Due'})`).join('\n')
+          : 'No invoices were created today.';
+        return json(res, 200, { message: `Today’s invoice report (${report.date})\n\nCustomer sales: ₨${salesTotal.toLocaleString()}\nCustomer collections: ₨${collectedTotal.toLocaleString()}\nCustomer invoices: ${customerInvoices.length}\nVendor invoices: ${vendorInvoices.length}\n\n${lines}` });
+      }
       const reply = await askAssistant([
         { role: 'system', content: `You are Naidify AI, a concise and professional business assistant inside a fish-trading invoice ledger. The signed-in user has role ${user.role}. Help with invoices, payments, balances, contacts, expenses and reports. Use the supplied live ledger context when answering and never say you lack access when relevant context is present. Do not claim that you completed a database action; explain that actions will require confirmation and approved backend tools. If a live figure is not available in the provided context, say so clearly rather than inventing it. Keep replies under 120 words.` },
         ...(liveContext ? [{ role: 'system', content: `LIVE LEDGER CONTEXT (trusted backend result; answer from this data): ${liveContext}` }] : []),
