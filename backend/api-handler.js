@@ -121,7 +121,7 @@ async function liveCustomerContext(user, message) {
   const normalized = String(message || '').toLowerCase();
   if (!/\b(customer|customers|client|clients|buyer|buyers)\b/.test(normalized)) return '';
   if (!/\b(list|find|search|show|directory|lookup|named?)\b/.test(normalized)) return '';
-  const searchMatch = String(message || '').match(/(?:customer|client|buyer)\s+(?:named?\s+)?["“]?([^"”.,!?]+)["”]?$/i);
+  const searchMatch = String(message || '').match(/(?:customer|client|buyer)\s+(?:(?:named|called)\s+(?:as\s+)?|as\s+)?["“]?([^"”.,!?]+)["”]?$/i);
   const search = searchMatch?.[1]?.trim() || '';
   const params = [];
   const conditions = ["type='customer'"];
@@ -136,6 +136,18 @@ async function liveCustomerContext(user, message) {
 async function prepareChatWrite(user, message) {
   if (user.role !== 'admin') return null;
   const normalized = String(message || '').trim();
+  if (/\b(create|make|new|draft)\b.*\binvoice\b/i.test(normalized)) {
+    const customerMatch = normalized.match(/\bfor\s+(.+?)(?=\s+for\s+|\s+total\b|\s+amount\b|\s+at\s+₨?|\s+at\s+rs\.?|\s+₨|\s+\d|$)/i);
+    const contactName = String(customerMatch?.[1] || '').trim().replace(/[.,!?]+$/, '');
+    if (!contactName) return { missing: 'Tell me the customer name to create the invoice for.' };
+    const totalMatch = normalized.match(/(?:total|amount|price|at)\s*(?:is|of|:)?\s*(?:₨|rs\.?|pkr\.?)?\s*([\d,]+(?:\.\d+)?)/i) || normalized.match(/₨\s*([\d,]+(?:\.\d+)?)/i);
+    const totalAmount = totalMatch ? Number(totalMatch[1].replace(/,/g, '')) : 0;
+    if (!totalAmount) return { missing: 'Tell me the invoice total, for example: “Create an invoice for JAVAID METRO, total ₨50,000.”' };
+    const { rows } = await query('SELECT id,full_name,company_name,email,phone FROM contacts WHERE type=\'customer\' AND (full_name ILIKE $1 OR company_name ILIKE $1) ORDER BY full_name LIMIT 5', [`%${contactName}%`]);
+    if (rows.length !== 1) return { missing: rows.length ? `I found more than one customer matching “${contactName}”. Please use the full customer name.` : `I couldn’t find customer “${contactName}”. Use “show customer list” to find the exact name.` };
+    const contact = rows[0];
+    return { type: 'create_invoice', customerId: contact.id, customerName: contact.company_name || contact.full_name, customerEmail: contact.email || '', customerPhone: contact.phone || '', totalAmount, summary: `Create a ₨${totalAmount.toLocaleString()} customer invoice for ${contact.company_name || contact.full_name}.` };
+  }
   const amountMatch = normalized.match(/(?:₨|rs\.?|pkr\.?|amount\s*)?\s*([\d,]+(?:\.\d+)?)/i);
   const amount = amountMatch ? Number(amountMatch[1].replace(/,/g, '')) : 0;
   if (!amount || amount <= 0) return null;
@@ -164,6 +176,38 @@ async function executeChatWrite(action) {
   if (action.type === 'add_expense') {
     await query('INSERT INTO cash_expenses(name,amount,description,tag) VALUES($1,$2,$3,$4)', [action.description, action.amount, action.description, 'expense']);
     return `Expense added successfully: ₨${Number(action.amount).toLocaleString()} for ${action.description}.`;
+  }
+  if (action.type === 'create_invoice') {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const id = await reserveInvoiceId(client);
+      const item = { description: 'Chatbot invoice item', quantity: 1, price: action.totalAmount, total: action.totalAmount };
+      const normalized = normalizeInvoice({
+        id,
+        date: pakistanToday(),
+        customerName: action.customerName,
+        customerEmail: action.customerEmail,
+        customerPhone: action.customerPhone,
+        customerId: action.customerId,
+        totalAmount: action.totalAmount,
+        amountPaid: 0,
+        status: 'Due',
+        items: [item],
+        payments: [],
+        invoiceType: 'customer',
+      });
+      const vals = invoiceParams(normalized);
+      await client.query(`INSERT INTO invoices (${invoiceColumns}) VALUES (${vals.map((_, index) => `$${index + 1}`).join(',')})`, vals);
+      await syncInvoicePayments(client, normalized);
+      await client.query('COMMIT');
+      return `Invoice ${id} created successfully for ${action.customerName}: ₨${Number(action.totalAmount).toLocaleString()} due.`;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
   throw new Error('Unsupported chatbot action.');
 }
