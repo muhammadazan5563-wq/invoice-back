@@ -117,6 +117,22 @@ async function liveChatContext(user, message) {
   }
   return JSON.stringify({ date: today, reportType: isToday ? 'today' : isOverdue ? 'overdue' : 'recent', invoiceCount: results.length, invoices: results });
 }
+async function liveCustomerContext(user, message) {
+  const normalized = String(message || '').toLowerCase();
+  if (!/\b(customer|customers|client|clients|buyer|buyers)\b/.test(normalized)) return '';
+  if (!/\b(list|find|search|show|directory|lookup|named?)\b/.test(normalized)) return '';
+  const searchMatch = String(message || '').match(/(?:customer|client|buyer)\s+(?:named?\s+)?["“]?([^"”.,!?]+)["”]?$/i);
+  const search = searchMatch?.[1]?.trim() || '';
+  const params = [];
+  const conditions = ["type='customer'"];
+  if (user.role === 'customer') { params.push(user.contact_id); conditions.push(`id=$${params.length}`); }
+  if (search && !/^(list|list all|directory|details|information)$/i.test(search)) {
+    params.push(`%${search}%`);
+    conditions.push(`(full_name ILIKE $${params.length} OR company_name ILIKE $${params.length} OR email ILIKE $${params.length} OR phone ILIKE $${params.length})`);
+  }
+  const { rows } = await query(`SELECT id,full_name,company_name,email,phone,location FROM contacts WHERE ${conditions.join(' AND ')} ORDER BY full_name ASC LIMIT 100`, params);
+  return JSON.stringify({ search, customers: rows.map((row) => ({ id: row.id, name: row.full_name, company: row.company_name, email: row.email, phone: row.phone, location: row.location })) });
+}
 async function prepareChatWrite(user, message) {
   if (user.role !== 'admin') return null;
   const normalized = String(message || '').trim();
@@ -510,6 +526,14 @@ export default async function apiHandler(req, res) {
         role: item?.role === 'user' ? 'user' : 'assistant',
         content: String(item?.content || '').slice(0, 4000),
       })).filter((item) => item.content) : [];
+      const customerContext = await liveCustomerContext(user, message);
+      if (customerContext) {
+        const directory = JSON.parse(customerContext);
+        const lines = directory.customers.length
+          ? directory.customers.map((customer) => `• ${customer.name || 'Unnamed customer'}${customer.company ? ` — ${customer.company}` : ''}${customer.phone ? ` — ${customer.phone}` : ''}${customer.email ? ` — ${customer.email}` : ''}`).join('\n')
+          : `No customers found${directory.search ? ` matching “${directory.search}”` : ''}.`;
+        return json(res, 200, { message: `${directory.search ? `Customer search: ${directory.search}` : 'Customer directory'}\n\n${lines}` });
+      }
       const liveContext = await liveChatContext(user, message);
       if (liveContext && /invoice|sales|sale/.test(message.toLowerCase()) && /(today|todays|today['’]s|آج|آج|recent|latest|newest|last|overdue)/i.test(message)) {
         const report = JSON.parse(liveContext);
